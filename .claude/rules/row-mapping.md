@@ -55,7 +55,17 @@ paths:
 
 丸め方や失敗を伴う変換は `FieldMarshaler` / `MarshalFunc` の領分。**書く人が方針を明示する場所がある**ので、タグ側で暗黙に決めない。
 
-`data_type` のような独立タグキーにしなかったのは、`record` が同じ役割（Go の型から BQ の型を選ぶ）で `bqsink` タグにいるから。`partition` / `cluster` / `description` が独立キーなのは**テーブルの話で列の話ではない**という線引き。
+### 独立タグキー（`data_type` / `type`）は却下済み。蒸し返さない
+
+**列の型は `bqsink` タグのオプションで指定する。独立したタグキーは立てない。** 検討して却下した。
+
+- `record` が同じ役割（Go の型から BQ の型を選ぶ）で `bqsink` タグにいる。同じ役割を2箇所に分けると、読む人が毎回「なぜ分かれているのか」を考える
+- `partition` / `cluster` / `description` が独立キーなのは**テーブルの話で列の話ではない**から。この線引きで一貫する
+- 対応するのが `time.Time` だけになったので、キーに名前を付ける必要自体が消えた（`data_type` は `INFORMATION_SCHEMA.COLUMNS.data_type` と同名にできる利点があったが、値が3つしかないなら見合わない）
+
+**struct を `data_type:"record"` に移す案も却下済み。** `record` は `bqsink` タグに残す。
+
+`big.Rat` を BIGNUMERIC 既定にするかは**これとは別の未決着の論点**で、ここでは決まっていない。混同しないこと。
 
 ## Marshaler と衝突したらエラーにする（precedence にしない）
 
@@ -137,11 +147,13 @@ Sink(ctx, v) → FillRow(コピー) → toRow → retrying{ Append }
 
 判定は「`*T` が実装している」かつ「`T`（値）も実装している」= 値レシーバ。`T` がポインタ型の場合は別経路で、その場合だけ**呼び出し側の値が書き換わる**（GoDoc に明記済み）。
 
-## `_sink_` プレフィックスは実測で通ることを確認済み
+## `_ingestion_` プレフィックスは実測で通ることを確認済み
 
-BigQuery の列名はアンダースコアで始められる（`FieldSchema.Name` の godoc に "must start with a letter or underscore"）。`_PARTITIONTIME` などの疑似列は大文字なので衝突しない。
+列名は `_ingestion_at` / `_ingestion_id` / `_ingestion_row_id`（`IngestionMetadata`）。BigQuery の列名はアンダースコアで始められる（`FieldSchema.Name` の godoc に "must start with a letter or underscore"）。`_PARTITIONTIME` などの疑似列は大文字なので衝突しない。
 
 **統合テスト `TestIntegrationIngestionMetadata` が実際にテーブルを作って確認している。** 列名の規則を変えるときはこれを回す。
+
+`_sink_` / `_sinker_` は検討途中の名前で**採用していない**。`_sink_id` は `Sink` を呼ぶたびに変わる印象になり、`_sinker_id` は型名の露出になるため、コード上の語彙（`IngestionMetadata`）と揃えて `_ingestion_` にした。
 
 ## UUID v7 を選んだ理由
 

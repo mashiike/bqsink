@@ -30,7 +30,7 @@ BigQuery への書き込みコードを各所で書いていて、一番しん�
 | 既定の戦略は `AppendNewColumns{CreateIfMissing: true}` | 追従が中核価値なので既定で有効。`AppendNewColumns` は非破壊（列追加と緩和のみ）なので事故の規模が小さい。DROP は `SyncAllColumns` を明示させる |
 | Functional Options は `New` だけ | Strategy の設定は構造体リテラル。`New` の Option とどちらか分からなくなるのを避ける |
 | GoDoc は英語 | `pkg.go.dev` に載る OSS。テストのサブテスト名も英語で統一 |
-| メタデータ列は `_sink_` プレフィックス | 業務列と区別でき、列一覧で先頭に集まる。アンダースコア始まりが BQ で通ることは統合テストで実測済み |
+| メタデータ列は `_ingestion_` プレフィックス（`IngestionMetadata`） | 業務列と区別でき、列一覧で先頭に集まる。コード上の語彙と列名を揃えている。アンダースコア始まりが BQ で通ることは統合テストで実測済み |
 | `SinkerID` / `RowID` は UUID v7 | 辞書順が生成順になるのでクラスタリングキーに使える。v4 にすると失われる |
 
 ## 実装の指針
