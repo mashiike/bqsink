@@ -134,7 +134,10 @@ func rowFillerOf[T any]() (fillerFunc[T], error) {
 		}
 		// T is already a pointer, so the value the caller passed is the filler.
 		return func(v *T) RowFiller {
-			filler, _ := any(*v).(RowFiller)
+			filler, ok := any(*v).(RowFiller)
+			if !ok {
+				return nil
+			}
 			return filler
 		}, nil
 	}
@@ -148,7 +151,10 @@ func rowFillerOf[T any]() (fillerFunc[T], error) {
 			t)
 	}
 	return func(v *T) RowFiller {
-		filler, _ := any(v).(RowFiller)
+		filler, ok := any(v).(RowFiller)
+		if !ok {
+			return nil
+		}
 		return filler
 	}, nil
 }

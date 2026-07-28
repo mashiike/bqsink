@@ -1,0 +1,38 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+      time: "20:00"
+    open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: "go.opentelemetry.io/*"
+        update-types: ["version-update:semver-patch"]
+      - dependency-name: "google.golang.org/genproto*"
+        update-types: ["version-update:semver-patch"]
+    labels:
+      - "dependencies"
+    groups:
+      google-cloud:
+        patterns:
+          - "cloud.google.com/go"
+          - "cloud.google.com/go/*"
+          - "github.com/googleapis/*"
+          - "google.golang.org/api"
+          - "google.golang.org/genproto*"
+      opentelemetry:
+        patterns:
+          - "go.opentelemetry.io/*"
+      golang-x:
+        patterns:
+          - "golang.org/x/*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    open-pull-requests-limit: 5
+    schedule:
+      interval: "weekly"
+      time: "20:00"
+    labels:
+      - "dependencies"
