@@ -27,6 +27,10 @@ go.work.sum
 # env file
 .env
 
+# Claude Code local settings. Holds the integration tests' project and bucket,
+# which are per-developer and must not reach this public repository.
+.claude/settings.local.json
+
 # Editor/IDE
 # .idea/
 # .vscode/
