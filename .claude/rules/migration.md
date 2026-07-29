@@ -98,8 +98,38 @@ gRPC: Unavailable, DeadlineExceeded, ResourceExhausted, Internal, Aborted
 
 ドット3分割で安全なのは、SDK の godoc が dataset / table 名を「letters, numbers, underscores のみ」と明記しており、project ID にもドットが入らないため。
 
-## `WithSchema` を渡しても plan は必要
+## スキーマを明示しても plan は必要
 
-行を書くには struct を歩く必要があるので、`InferSchema` が失敗する型は `WithSchema` を渡しても `New` が失敗する。**「スキーマを明示すればタグ推論を完全に回避できる」わけではない。**
+行を書くには struct を歩く必要があるので、`InferSchema` が失敗する型は `BigQueryTableMetadata` でスキーマを書き切っても `New` が失敗する。**「スキーマを明示すればタグ推論を完全に回避できる」わけではない。**
+
+スキーマを外から渡す `WithSchema` / `WithTableMetadata` は削除済み（下記「宣言は行の型に属する」）。
 
 `checkPlanAgainstSchema` が「struct が書く列が宣言スキーマに含まれるか」を検証する。含まれなければ I/O 前に失敗させる。逆（スキーマに余分な列がある）は許容し、その列は NULL のまま。
+
+## 宣言は行の型に属する
+
+**テーブルの姿を外から渡す Option は作らない。** `WithSchema` / `WithTableMetadata` は一度存在したが 2026-07-29 に削除した。
+
+- スキーマ → struct タグ、またはタグで書けないもの（BIGNUMERIC の精度・列の policy tag・ネスト RECORD）は `TableDefiner.BigQueryTableMetadata()` の `Schema`
+- テーブルの description とラベル → 埋め込んだ `TableMeta` のタグ、または同じメソッド
+- パーティション・クラスタリング → 列のタグ、または同じメソッド
+- 有効期限などその他 → メソッドのみ
+
+**理由は「行 struct にはドメイン知識が載っている」こと。** 列の意味を知っているのは行の型を定義した場所なので、そこがテーブルの姿を語る唯一の場所であるべき。他パッケージで定義された行を扱うケースは想定していない（ドメイン知識を反映できないため）。
+
+`WithMarshalers` は例外として残している。こちらは**テーブルの宣言ではなく値の符号化**で、`uuid.UUID` のような他パッケージのフィールド型には `FieldMarshaler` メソッドを足せないため外から登録する口が必要。
+
+`resolveSchema(metadata, plan)` は「`BigQueryTableMetadata` に `Schema` があればそれ、無ければタグ導出」の2択だけになった。`config` にスキーマもメタデータも持っていない。
+
+テストで「タグとメタデータの矛盾」を表で回すときは `New` ではなく `resolveTableMetadata` を直接呼ぶ。**メソッドは型ごとに1つしか書けないので、1つの型で複数の矛盾パターンを表現できない**（`layout_test.go`）。`New` 経由の end-to-end は1件だけ残してある。
+
+## `TableMeta` は列を作らない埋め込みマーカー
+
+テーブルの description とラベルだけメソッドしか経路が無かった非対称を埋めるために 2026-07-29 に追加した（`bun.BaseModel` と同じ形）。
+
+- **列を作らないのは特別扱いではない。** exported フィールドが0個の埋め込み struct は `collectFields` が展開して何も残さないという既存の規則の結果（`sync.Mutex` と同じ）。だから `collectFields` には手を入れていない
+- **タグは `tableMetaOf` が `reflect` で別に読む。** 列の走査とは独立
+- **`t` の直下のフィールドしか見ない。** 埋め込みの奥にある `TableMeta` は読まない。「型を1目見ればテーブルが分かる」を保つため。緩めるのは後から非破壊でできる
+- **`bqsink` / `partition` / `cluster` タグが付いていたらエラー。** 列を指すタグを黙って無視しない
+- **`TableMeta` を2回埋め込むケースの検査は書いていない。** 同じ型を2つ埋め込むとフィールド名が衝突してコンパイルエラーになるので到達しない
+- `labels:"k=v,k=v"` が曖昧にならないのは、**BigQuery のラベルのキーと値が小文字・数字・アンダースコア・ダッシュのみ**と公式ドキュメントに明記されているため（2026-07-29 に原文で確認）。`,` も `=` も入らないのでエスケープ不要。**文字種の検査は BigQuery に任せている**（国際文字も許されるので自前で狭めると誤って弾く）。`parseLabels` が見るのは並びの形だけ

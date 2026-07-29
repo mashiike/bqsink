@@ -38,9 +38,14 @@ var (
 // TableDefiner lets a row type declare table level settings such as
 // partitioning, clustering, labels and expiration.
 //
-// The returned metadata's Schema field, if set, overrides the schema derived
-// from struct tags. Read-only fields (ETag, CreationTime, LastModifiedTime,
-// NumBytes, NumRows, FullID, Type) are ignored.
+// The returned metadata's Schema field, if set, overrides the schema derived from
+// struct tags. That is where a column struct tags cannot describe belongs, such as
+// BIGNUMERIC precision, a column description or a policy tag: bqsink has no Option
+// for declaring a schema, since the row type is meant to be the one place that
+// says what the table holds.
+//
+// Read-only fields (ETag, CreationTime, LastModifiedTime, NumBytes, NumRows,
+// FullID, Type) are ignored.
 type TableDefiner interface {
 	BigQueryTableMetadata() *bigquery.TableMetadata
 }
@@ -110,15 +115,17 @@ type Sinker[T any] struct {
 
 // New returns a Sinker that writes rows of type T to the table relation names.
 //
-// The schema comes from T's struct tags, following the rules described on
-// InferSchema, unless WithSchema is given. Table level settings come from T's
-// BigQueryTableMetadata method if T implements TableDefiner, unless
-// WithTableMetadata is given.
+// What the table should look like is declared by T alone, and no Option changes
+// that. The schema comes from its struct tags, following the rules described on
+// InferSchema, and table level settings from its BigQueryTableMetadata method when
+// T implements TableDefiner. That method's Schema field, when set, takes the place
+// of the derived schema, which is how a column struct tags cannot describe gets
+// declared.
 //
-// T must be mappable to a row even when the schema is given outright, since its
-// fields are what gets written. When the schema is given, every column the struct
-// would write has to be present in it; New fails otherwise, rather than letting
-// BigQuery reject the first write.
+// T must be mappable to a row even when it spells its schema out, since its fields
+// are what gets written. Every column the struct would write has to be present in
+// the spelled out schema; New fails otherwise, rather than letting BigQuery reject
+// the first write.
 //
 // Without options the migration strategy is AppendNewColumns{CreateIfMissing:
 // true}, which creates the table if it is absent and adds columns the declaration
@@ -143,15 +150,12 @@ func New[T any](client *bigquery.Client, relation Relation, opts ...Option) (*Si
 			return nil, err
 		}
 	}
-	metadata := c.metadata
-	if metadata == nil {
-		metadata = tableMetadataOf[T]()
-	}
+	metadata := tableMetadataOf[T]()
 	plan, err := buildRowPlan(reflect.TypeFor[T](), c.marshalers)
 	if err != nil {
 		return nil, err
 	}
-	schema, err := resolveSchema(c, metadata, plan)
+	schema, err := resolveSchema(metadata, plan)
 	if err != nil {
 		return nil, err
 	}
@@ -205,29 +209,28 @@ func New[T any](client *bigquery.Client, relation Relation, opts ...Option) (*Si
 	}, nil
 }
 
-func resolveSchema(c config, metadata *bigquery.TableMetadata, plan *rowPlan) (bigquery.Schema, error) {
-	declared := c.schema
-	if declared == nil && metadata != nil {
-		declared = metadata.Schema
-	}
-	if declared == nil {
+// resolveSchema settles the declared schema: the one T's BigQueryTableMetadata
+// spells out if it has one, and otherwise the one its struct tags describe.
+func resolveSchema(metadata *bigquery.TableMetadata, plan *rowPlan) (bigquery.Schema, error) {
+	if metadata == nil || metadata.Schema == nil {
 		return plan.schema(), nil
 	}
+	declared := metadata.Schema
 	if err := checkPlanAgainstSchema(plan, declared); err != nil {
 		return nil, err
 	}
 	return declared, nil
 }
 
-// resolveTableMetadata folds the physical layout the tags describe into the table
-// metadata.
+// resolveTableMetadata folds what the tags describe about the table, its physical
+// layout and what an embedded TableMeta says, into the table metadata.
 //
 // Where the tags and the metadata both settle the same thing, that is a
 // contradiction rather than a precedence question, so it fails instead of quietly
 // preferring one: the declaration is meant to be the single description of the
 // table.
 func resolveTableMetadata(md *bigquery.TableMetadata, plan *rowPlan) (*bigquery.TableMetadata, error) {
-	if plan.partitioning == nil && plan.clustering == nil {
+	if plan.partitioning == nil && plan.clustering == nil && plan.description == "" && len(plan.labels) == 0 {
 		return md, nil
 	}
 	out := &bigquery.TableMetadata{}
@@ -248,6 +251,20 @@ func resolveTableMetadata(md *bigquery.TableMetadata, plan *rowPlan) (*bigquery.
 		if plan.requireFilter {
 			out.RequirePartitionFilter = true
 		}
+	}
+	if plan.description != "" {
+		if out.Description != "" {
+			return nil, fmt.Errorf("bqsink: %s tags a table description, but the table metadata already sets Description; drop one of them",
+				plan.goType)
+		}
+		out.Description = plan.description
+	}
+	if len(plan.labels) > 0 {
+		if len(out.Labels) > 0 {
+			return nil, fmt.Errorf("bqsink: %s tags table labels, but the table metadata already sets Labels; drop one of them",
+				plan.goType)
+		}
+		out.Labels = plan.labels
 	}
 	if plan.clustering != nil {
 		if out.Clustering != nil {

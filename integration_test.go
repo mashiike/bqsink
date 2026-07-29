@@ -254,7 +254,7 @@ func TestIntegrationLoadJobs(t *testing.T) {
 	relation := integrationRelation(t, client, projectID, datasetID)
 
 	s, err := New[integrationRow](client, relation,
-		WithMigration(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -284,7 +284,7 @@ func TestIntegrationStorageWrite(t *testing.T) {
 	relation := integrationRelation(t, client, projectID, datasetID)
 
 	s, err := New[integrationRow](client, relation,
-		WithMigration(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
 		WithWriteStrategy(&StorageWrite{}),
 	)
 	if err != nil {
@@ -322,7 +322,7 @@ func TestIntegrationLoadJobWithANarrowerSchema(t *testing.T) {
 
 	ctx := context.Background()
 	wide, err := New[integrationRow](client, relation,
-		WithMigration(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -373,7 +373,7 @@ func TestIntegrationAppendNewColumns(t *testing.T) {
 
 	ctx := context.Background()
 	before, err := New[narrowRow](client, relation,
-		WithMigration(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -384,7 +384,7 @@ func TestIntegrationAppendNewColumns(t *testing.T) {
 	}
 
 	after, err := New[grownRow](client, relation,
-		WithMigration(AppendNewColumns{}),
+		WithMigrationStrategy(AppendNewColumns{}),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -436,7 +436,7 @@ func TestIntegrationSyncAllColumnsDropsAColumn(t *testing.T) {
 
 	ctx := context.Background()
 	wide, err := New[grownRow](client, relation,
-		WithMigration(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -447,7 +447,7 @@ func TestIntegrationSyncAllColumnsDropsAColumn(t *testing.T) {
 	}
 
 	narrow, err := New[narrowRow](client, relation,
-		WithMigration(SyncAllColumns{}),
+		WithMigrationStrategy(SyncAllColumns{}),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -478,7 +478,7 @@ func TestIntegrationIgnoreColumnsKeepsAColumn(t *testing.T) {
 
 	ctx := context.Background()
 	wide, err := New[grownRow](client, relation,
-		WithMigration(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -489,7 +489,7 @@ func TestIntegrationIgnoreColumnsKeepsAColumn(t *testing.T) {
 	}
 
 	narrow, err := New[narrowRow](client, relation,
-		WithMigration(SyncAllColumns{IgnoreColumns: []string{"extra"}}),
+		WithMigrationStrategy(SyncAllColumns{IgnoreColumns: []string{"extra"}}),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -527,7 +527,7 @@ func TestIntegrationMissingTableIsReported(t *testing.T) {
 	// The default strategy creates a missing table, so this needs MigrationNone to
 	// reach ErrTableMissing at all.
 	s, err := New[narrowRow](client, relation,
-		WithMigration(MigrationNone{}),
+		WithMigrationStrategy(MigrationNone{}),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -578,7 +578,7 @@ func TestIntegrationLoadJobsThroughCloudStorage(t *testing.T) {
 		Prefix: "bqsink-integration",
 	}
 	s, err := New[integrationRow](client, relation,
-		WithMigration(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
 		WithWriteStrategy(&LoadJobs{Staging: staging}),
 	)
 	if err != nil {
@@ -621,7 +621,7 @@ func TestIntegrationStagedObjectIsRemoved(t *testing.T) {
 	prefix := fmt.Sprintf("bqsink-cleanup-%d", time.Now().UnixNano())
 	staging := &bqgcs.Staging{Client: gcs, Bucket: bucket, Prefix: prefix}
 	s, err := New[narrowRow](client, relation,
-		WithMigration(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
 		WithWriteStrategy(&LoadJobs{Staging: staging}),
 	)
 	if err != nil {
@@ -696,7 +696,7 @@ func TestIntegrationStagedObjectIsKept(t *testing.T) {
 
 	staging := &bqgcs.Staging{Client: gcs, Bucket: bucket, Prefix: prefix, Keep: true}
 	s, err := New[narrowRow](client, relation,
-		WithMigration(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
 		WithWriteStrategy(&LoadJobs{Staging: staging}),
 	)
 	if err != nil {
@@ -786,8 +786,11 @@ func TestIntegrationIngestionMetadata(t *testing.T) {
 	}
 }
 
-// layoutIntegrationRow describes the table's physical layout entirely in tags.
+// layoutIntegrationRow describes the table entirely in tags: its physical layout,
+// and through the embedded TableMeta the table's own description and labels.
 type layoutIntegrationRow struct {
+	TableMeta `description:"a table bqsink described in tags" labels:"purpose=bqsink-integration,empty="`
+
 	At     time.Time `bqsink:"at,required" partition:"day"`
 	UserID string    `bqsink:"user_id" cluster:"1"`
 	Region string    `bqsink:"region" cluster:"2"`
@@ -924,5 +927,14 @@ func TestIntegrationTaggedLayout(t *testing.T) {
 		if got, want := f.Description, "billed amount, including tax"; got != want {
 			t.Errorf("amount description = %q, want %q", got, want)
 		}
+	}
+	// The embedded TableMeta's tags: whether BigQuery keeps a table description and
+	// a label with an empty value can only be seen here.
+	if got, want := md.Description, "a table bqsink described in tags"; got != want {
+		t.Errorf("table description = %q, want %q", got, want)
+	}
+	wantLabels := map[string]string{"purpose": "bqsink-integration", "empty": ""}
+	if !reflect.DeepEqual(md.Labels, wantLabels) {
+		t.Errorf("labels = %v, want %v", md.Labels, wantLabels)
 	}
 }

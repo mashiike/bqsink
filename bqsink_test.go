@@ -210,34 +210,6 @@ func TestNewPrefersSchemaFromTableDefiner(t *testing.T) {
 	}
 }
 
-func TestNewWithSchemaWins(t *testing.T) {
-	t.Parallel()
-
-	explicit := bigquery.Schema{
-		{Name: "explicit", Type: bigquery.BigNumericFieldType, Precision: 38, Scale: 9, Description: "billed amount"},
-	}
-	s, err := New[schemaDefinedRow](testClient(t), testRelation(), WithSchema(explicit))
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	if !reflect.DeepEqual(s.Schema(), explicit) {
-		t.Errorf("Schema() = %s, want %s", formatSchema(s.Schema()), formatSchema(explicit))
-	}
-}
-
-func TestNewWithTableMetadataWins(t *testing.T) {
-	t.Parallel()
-
-	md := &bigquery.TableMetadata{Labels: map[string]string{"receiver": "option"}}
-	s, err := New[definedRow](testClient(t), testRelation(), WithTableMetadata(md))
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	if got := s.metadata.Labels["receiver"]; got != "option" {
-		t.Errorf("Labels[receiver] = %q, want %q", got, "option")
-	}
-}
-
 func TestNewUsesDefaultRetryPolicy(t *testing.T) {
 	t.Parallel()
 
@@ -283,9 +255,7 @@ func TestNewRejectsBadOptions(t *testing.T) {
 		name string
 		opt  Option
 	}{
-		{name: "an empty schema", opt: WithSchema(nil)},
-		{name: "nil metadata", opt: WithTableMetadata(nil)},
-		{name: "a nil migration strategy", opt: WithMigration(nil)},
+		{name: "a nil migration strategy", opt: WithMigrationStrategy(nil)},
 		{name: "a nil write strategy", opt: WithWriteStrategy(nil)},
 		{name: "a nil retry policy", opt: WithRetryPolicy(nil)},
 	}
@@ -365,7 +335,7 @@ func TestNewRejectsInvalidStrategies(t *testing.T) {
 		},
 		{
 			name: "a SyncAllColumns ignoring an empty name",
-			opt:  WithMigration(SyncAllColumns{IgnoreColumns: []string{""}}),
+			opt:  WithMigrationStrategy(SyncAllColumns{IgnoreColumns: []string{""}}),
 		},
 	}
 

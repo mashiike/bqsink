@@ -270,35 +270,49 @@ func TestNewAppliesMarshalersToTheSchema(t *testing.T) {
 	}
 }
 
-func TestWithSchemaOverridesTheDerivedTypes(t *testing.T) {
-	t.Parallel()
+// spelledOutRow writes the same fields as marshalerRow and spells its schema out,
+// which is how a row type takes full control of its columns.
+type spelledOutRow marshalerRow
 
-	explicit := bigquery.Schema{
+func spelledOutSchema() bigquery.Schema {
+	return bigquery.Schema{
 		{Name: "Payload", Type: bigquery.StringFieldType},
 		{Name: "PtrCode", Type: bigquery.StringFieldType},
 		{Name: "Many", Type: bigquery.StringFieldType, Repeated: true},
 		{Name: "External", Type: bigquery.BigNumericFieldType, Precision: 38, Scale: 9},
 	}
-	s, err := New[marshalerRow](testClient(t), testRelation(),
-		WithMarshalers(jsonMarshalers()),
-		WithSchema(explicit),
-	)
+}
+
+func (spelledOutRow) BigQueryTableMetadata() *bigquery.TableMetadata {
+	return &bigquery.TableMetadata{Schema: spelledOutSchema()}
+}
+
+func TestASpelledOutSchemaOverridesTheDerivedTypes(t *testing.T) {
+	t.Parallel()
+
+	s, err := New[spelledOutRow](testClient(t), testRelation(), WithMarshalers(jsonMarshalers()))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	if !reflect.DeepEqual(s.Schema(), explicit) {
-		t.Errorf("Schema() = %s, want the explicit %s", formatSchema(s.Schema()), formatSchema(explicit))
+	if want := spelledOutSchema(); !reflect.DeepEqual(s.Schema(), want) {
+		t.Errorf("Schema() = %s, want the spelled out %s", formatSchema(s.Schema()), formatSchema(want))
 	}
 }
 
-func TestWithSchemaMustCoverEveryWrittenColumn(t *testing.T) {
+// tooNarrowRow leaves out columns its fields would write, which New has to catch
+// rather than let BigQuery reject the first row.
+type tooNarrowRow marshalerRow
+
+func (tooNarrowRow) BigQueryTableMetadata() *bigquery.TableMetadata {
+	return &bigquery.TableMetadata{
+		Schema: bigquery.Schema{{Name: "Payload", Type: bigquery.JSONFieldType}},
+	}
+}
+
+func TestASpelledOutSchemaMustCoverEveryWrittenColumn(t *testing.T) {
 	t.Parallel()
 
-	tooNarrow := bigquery.Schema{{Name: "Payload", Type: bigquery.JSONFieldType}}
-	_, err := New[marshalerRow](testClient(t), testRelation(),
-		WithMarshalers(jsonMarshalers()),
-		WithSchema(tooNarrow),
-	)
+	_, err := New[tooNarrowRow](testClient(t), testRelation(), WithMarshalers(jsonMarshalers()))
 	if err == nil {
 		t.Fatal("New() error = nil, want a rejection of the schema missing columns the struct writes")
 	}

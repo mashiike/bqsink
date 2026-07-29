@@ -249,7 +249,7 @@ func TestMigrateLogsWhatItChanged(t *testing.T) {
 			{Name: "Count", Type: bigquery.IntegerFieldType},
 			{Name: "legacy", Type: bigquery.StringFieldType},
 		})
-		s := newTestSinker[simpleRow](t, fake, WithMigration(SyncAllColumns{}), WithLogger(logger))
+		s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(SyncAllColumns{}), WithLogger(logger))
 		if err := s.Migrate(t.Context()); err != nil {
 			t.Fatalf("Migrate() error = %v", err)
 		}
@@ -296,7 +296,7 @@ func TestStrategyLogsTheDifferenceItLeaves(t *testing.T) {
 	t.Run("MigrationNone warns that it reconciles nothing", func(t *testing.T) {
 		t.Parallel()
 		rec, logger := recordingLogger()
-		s := newTestSinker[simpleRow](t, tableWithLegacy(), WithMigration(MigrationNone{}), WithLogger(logger))
+		s := newTestSinker[simpleRow](t, tableWithLegacy(), WithMigrationStrategy(MigrationNone{}), WithLogger(logger))
 		if err := s.Migrate(t.Context()); err != nil {
 			t.Fatalf("Migrate() error = %v", err)
 		}
@@ -323,7 +323,7 @@ func TestStrategyLogsTheDifferenceItLeaves(t *testing.T) {
 		t.Parallel()
 		rec, logger := recordingLogger()
 		s := newTestSinker[simpleRow](t, tableWithLegacy(),
-			WithMigration(SyncAllColumns{IgnoreColumns: []string{"legacy"}}),
+			WithMigrationStrategy(SyncAllColumns{IgnoreColumns: []string{"legacy"}}),
 			WithLogger(logger),
 		)
 		if err := s.Migrate(t.Context()); err != nil {
@@ -344,7 +344,7 @@ func TestStrategyLogsTheDifferenceItLeaves(t *testing.T) {
 			{Name: "Count", Type: bigquery.IntegerFieldType},
 		})
 		s := newTestSinker[simpleRow](t, fake,
-			WithMigration(SyncAllColumns{IgnoreColumns: []string{"legacy"}}),
+			WithMigrationStrategy(SyncAllColumns{IgnoreColumns: []string{"legacy"}}),
 			WithLogger(logger),
 		)
 		if err := s.Migrate(t.Context()); err != nil {
@@ -368,7 +368,7 @@ func TestRetryLogsOnlyTheFailuresItSwallows(t *testing.T) {
 		rec, logger := recordingLogger()
 		writer := &flakyRowWriter{failAppends: 2, appendErr: unavailableErr()}
 		s := newTestSinker[nestedRow](t, migratedTable(),
-			WithMigration(AppendNewColumns{}),
+			WithMigrationStrategy(AppendNewColumns{}),
 			WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
 			WithLogger(logger),
 		)
@@ -396,7 +396,7 @@ func TestRetryLogsOnlyTheFailuresItSwallows(t *testing.T) {
 		rec, logger := recordingLogger()
 		writer := &flakyRowWriter{failAppends: 99, appendErr: unavailableErr()}
 		s := newTestSinker[nestedRow](t, migratedTable(),
-			WithMigration(AppendNewColumns{}),
+			WithMigrationStrategy(AppendNewColumns{}),
 			WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
 			WithLogger(logger),
 		)
@@ -416,7 +416,7 @@ func TestRetryLogsOnlyTheFailuresItSwallows(t *testing.T) {
 		rec, logger := recordingLogger()
 		writer := &flakyRowWriter{failAppends: 1, appendErr: forbiddenErr()}
 		s := newTestSinker[nestedRow](t, migratedTable(),
-			WithMigration(AppendNewColumns{}),
+			WithMigrationStrategy(AppendNewColumns{}),
 			WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
 			WithLogger(logger),
 		)
@@ -450,7 +450,7 @@ func TestTheWriterIsHandedTheLogger(t *testing.T) {
 	_, logger := recordingLogger()
 	writer := &fakeRowWriter{}
 	s := newTestSinker[nestedRow](t, migratedTable(),
-		WithMigration(AppendNewColumns{}),
+		WithMigrationStrategy(AppendNewColumns{}),
 		WithWriteStrategy(&fakeWriteStrategy{writer: writer}),
 		WithLogger(logger),
 	)

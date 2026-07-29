@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 
-	"cloud.google.com/go/bigquery"
 	gax "github.com/googleapis/gax-go/v2"
 )
 
@@ -29,8 +28,6 @@ func validateStrategy(name string, s any) error {
 }
 
 type config struct {
-	schema        bigquery.Schema
-	metadata      *bigquery.TableMetadata
 	marshalers    *Marshalers
 	strategy      MigrationStrategy
 	writeStrategy WriteStrategy
@@ -42,36 +39,13 @@ type config struct {
 //
 // Options are the only place bqsink uses this pattern. A strategy is a struct
 // instead, so that its settings never look like an Option.
+//
+// No Option describes the table. What the table looks like belongs to T, through
+// its struct tags and its BigQueryTableMetadata method, so that one place answers
+// what the table should be. The Options here settle how bqsink behaves around
+// that declaration: what to do about a difference, how rows travel, what gets
+// logged.
 type Option func(*config) error
-
-// WithSchema uses schema instead of deriving one from T's struct tags.
-//
-// Use it for columns struct tags cannot express, such as BIGNUMERIC precision,
-// column descriptions or policy tags.
-func WithSchema(schema bigquery.Schema) Option {
-	return func(c *config) error {
-		if len(schema) == 0 {
-			return errors.New("bqsink: WithSchema: schema is empty")
-		}
-		c.schema = schema
-		return nil
-	}
-}
-
-// WithTableMetadata uses md for table level settings instead of T's
-// BigQueryTableMetadata method.
-//
-// If md.Schema is set it also takes the place of the schema derived from struct
-// tags, so WithSchema is unnecessary.
-func WithTableMetadata(md *bigquery.TableMetadata) Option {
-	return func(c *config) error {
-		if md == nil {
-			return errors.New("bqsink: WithTableMetadata: metadata is nil")
-		}
-		c.metadata = md
-		return nil
-	}
-}
 
 // WithMarshalers registers per-type overrides of how a Go type becomes a
 // BigQuery column, built with MarshalFunc.
@@ -80,8 +54,12 @@ func WithTableMetadata(md *bigquery.TableMetadata) Option {
 // written, and they win over a type's own FieldMarshaler. Registering the same Go
 // type more than once keeps the mapping registered last.
 //
-// The overrides have no effect when WithSchema or a TableDefiner supplies the
-// schema outright, since nothing is derived in that case.
+// This is not a way to describe the table from outside T. It exists because a
+// field's type may come from another package, which cannot be given a
+// FieldMarshaler method: the mapping is about encoding a value, not about what the
+// table holds. Where a TableDefiner supplies the schema outright the overrides do
+// not reach it, since nothing is derived in that case, and they still decide how
+// the values are written.
 func WithMarshalers(marshalers ...*Marshalers) Option {
 	return func(c *config) error {
 		joined := joinMarshalers(marshalers)
@@ -96,7 +74,7 @@ func WithMarshalers(marshalers ...*Marshalers) Option {
 	}
 }
 
-// WithMigration selects the migration strategy. The default is
+// WithMigrationStrategy selects the migration strategy. The default is
 // AppendNewColumns{CreateIfMissing: true}: keeping the table in step with the
 // declaration is what bqsink is for, and adding a column is not destructive.
 //
@@ -105,12 +83,12 @@ func WithMarshalers(marshalers ...*Marshalers) Option {
 //
 // If s implements Validator, its Validate method decides whether the settings are
 // usable and New fails when they are not.
-func WithMigration(s MigrationStrategy) Option {
+func WithMigrationStrategy(s MigrationStrategy) Option {
 	return func(c *config) error {
 		if s == nil {
-			return errors.New("bqsink: WithMigration: strategy is nil")
+			return errors.New("bqsink: WithMigrationStrategy: strategy is nil")
 		}
-		if err := validateStrategy("WithMigration", s); err != nil {
+		if err := validateStrategy("WithMigrationStrategy", s); err != nil {
 			return err
 		}
 		c.strategy = s

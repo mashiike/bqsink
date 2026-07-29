@@ -29,6 +29,9 @@ BigQuery への書き込みコードを各所で書いていて、一番しん�
 | struct は既定で JSON 列、RECORD は `record` タグ | ネストにフィールドを足してもマイグレーション不要になる。列プルーニングが効かなくなるトレードオフは受け入れ済み |
 | 既定の戦略は `AppendNewColumns{CreateIfMissing: true}` | 追従が中核価値なので既定で有効。`AppendNewColumns` は非破壊（列追加と緩和のみ）なので事故の規模が小さい。DROP は `SyncAllColumns` を明示させる |
 | Functional Options は `New` だけ | Strategy の設定は構造体リテラル。`New` の Option とどちらか分からなくなるのを避ける |
+| **テーブルの姿を宣言する Option は作らない**（`WithSchema` / `WithTableMetadata` は削除済み） | 行 struct にはドメイン知識が載っているので、列の意味を語れるのは行の型を定義した場所だけ。スキーマもテーブル設定もタグか `TableDefiner` に書く。他パッケージで定義された行を扱うことは想定しない。`WithMarshalers` だけは例外（テーブルの宣言ではなく値の符号化で、他パッケージのフィールド型にはメソッドを足せない） |
+| テーブルの description とラベルは埋め込み `TableMeta` のタグ | メソッドしか経路が無いのは他の宣言（列・パーティション・クラスタリング）と非対称だった。列を作らない埋め込みマーカーにタグを付ける形（`bun.BaseModel` と同じ）で埋めた |
+| Option の名前は引数の型名に合わせる（`WithMigrationStrategy` / `WithWriteStrategy`） | godoc で隣に並ぶので、片方だけ `Strategy` が落ちていると目に付く |
 | GoDoc は英語 | `pkg.go.dev` に載る OSS。テストのサブテスト名も英語で統一 |
 | メタデータ列は `_ingestion_` プレフィックス（`IngestionMetadata`） | 業務列と区別でき、列一覧で先頭に集まる。コード上の語彙と列名を揃えている。アンダースコア始まりが BQ で通ることは統合テストで実測済み |
 | ログは `slog`、`WithLogger` 未指定なら `slog.DiscardHandler` で破棄 | ライブラリが利用者の `slog.Default()` に断りなく書き始めないため。`io.Discard` + TextHandler と違い `Enabled` が false なので整形コストも出ない |

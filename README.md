@@ -5,10 +5,11 @@ Expressive BigQuery ingestion library for Go.
 bqsink writes rows to BigQuery and keeps the destination table's schema in sync
 with a schema declared in Go code.
 
-**The declaration is the source of truth.** The schema comes from struct tags or an
-explicit `bigquery.Schema`, and the real table follows it. bqsink never infers a
-schema from the data being written, so a field added to a struct becomes a column
-rather than a silent mismatch at write time.
+**The declaration is the source of truth, and it belongs to the row type.** The
+schema comes from struct tags, or from the type's own `BigQueryTableMetadata` where
+tags cannot say it, and the real table follows. No option describes the table:
+bqsink never infers a schema from the data being written either, so a field added to
+a struct becomes a column rather than a silent mismatch at write time.
 
 ```go
 type AccessLog struct {
@@ -138,15 +139,27 @@ Embedded structs are promoted into the outer struct, following the rules of
 
 ### Columns tags cannot express
 
-Pass a schema outright for BIGNUMERIC precision, column descriptions, policy tags
-and the like:
+For BIGNUMERIC precision, policy tags and the like, spell the schema out on the row
+type itself. **There is no option for declaring a schema:** what the table holds is
+said in one place, next to the fields it describes.
 
 ```go
-s, err := bqsink.New[Row](client, relation, bqsink.WithSchema(bigquery.Schema{
-	{Name: "amount", Type: bigquery.BigNumericFieldType, Precision: 38, Scale: 9,
-		Description: "billed amount"},
-}))
+type Row struct {
+	Amount *big.Rat `bqsink:"amount"`
+}
+
+func (Row) BigQueryTableMetadata() *bigquery.TableMetadata {
+	return &bigquery.TableMetadata{
+		Schema: bigquery.Schema{
+			{Name: "amount", Type: bigquery.BigNumericFieldType, Precision: 38, Scale: 9,
+				Description: "billed amount"},
+		},
+	}
+}
 ```
+
+The same method carries partitioning, clustering, labels and expiration, so a type
+that already has one simply adds `Schema` to it.
 
 Every column the struct would write has to be present in the schema; `New` fails
 otherwise rather than letting BigQuery reject the first write. A schema wider than
@@ -184,21 +197,43 @@ write rather than at `CREATE TABLE`:
 
 ### Table level settings
 
-Settings with no column to hang off — labels, expiration, and anything the tags
-above do not cover — come from a method:
+A description and labels have no column to hang off, so they go on an embedded
+`bqsink.TableMeta`, which contributes no column of its own:
+
+```go
+type AccessLog struct {
+	bqsink.TableMeta `description:"one row per request" labels:"team=data,env=prod"`
+
+	Timestamp time.Time `bqsink:"timestamp,required" partition:"day"`
+	UserID    string    `bqsink:"user_id"`
+}
+```
+
+| Key | Value |
+|---|---|
+| `description` | documents the table |
+| `labels` | a `key=value,key=value` list; a value may be empty, a key may not |
+
+Neither separator needs escaping, since BigQuery allows only lowercase letters,
+digits, underscores and dashes in a label's key and value. Only these two keys are
+read there — a `bqsink`, `partition` or `cluster` tag on `TableMeta` is rejected
+rather than ignored, and a `TableMeta` reached through another embedded struct is
+not searched for.
+
+Anything else — expiration, and whatever the tags do not cover — comes from a
+method:
 
 ```go
 func (AccessLog) BigQueryTableMetadata() *bigquery.TableMetadata {
 	return &bigquery.TableMetadata{
-		Labels:         map[string]string{"env": "prod"},
 		ExpirationTime: time.Now().Add(30 * 24 * time.Hour),
 	}
 }
 ```
 
 Declaring the same thing both ways is an error rather than one silently winning:
-`New` fails if the metadata sets `TimePartitioning`, `RangePartitioning` or
-`Clustering` for a column that also carries a tag.
+`New` fails if the metadata sets `Description`, `Labels`, `TimePartitioning`,
+`RangePartitioning` or `Clustering` that a tag also settles.
 
 ### Custom column types
 
@@ -296,11 +331,11 @@ All three take `CreateIfMissing`. Where it is off and the table does not exist,
 `Migrate` returns an error wrapping `ErrTableMissing` rather than creating it.
 
 ```go
-bqsink.WithMigration(bqsink.MigrationNone{})  // write to a table something else owns
+bqsink.WithMigrationStrategy(bqsink.MigrationNone{})  // write to a table something else owns
 ```
 
 ```go
-bqsink.WithMigration(bqsink.SyncAllColumns{
+bqsink.WithMigrationStrategy(bqsink.SyncAllColumns{
 	IgnoreColumns:   []string{"managed_elsewhere"},
 	CreateIfMissing: true,
 })

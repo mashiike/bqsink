@@ -676,7 +676,7 @@ func TestSinkWritesThroughTheWriteStrategy(t *testing.T) {
 	}}
 	writer := &fakeRowWriter{}
 	s := newTestSinker[nestedRow](t, fake,
-		WithMigration(AppendNewColumns{}),
+		WithMigrationStrategy(AppendNewColumns{}),
 		WithWriteStrategy(&fakeWriteStrategy{writer: writer}),
 	)
 

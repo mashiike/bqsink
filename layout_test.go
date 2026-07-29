@@ -380,11 +380,21 @@ func TestNewAppliesTheTaggedLayout(t *testing.T) {
 	}
 }
 
-// metadataConflictRow tags a layout that WithTableMetadata also sets.
+// metadataConflictRow tags a layout that its own BigQueryTableMetadata also sets.
 type metadataConflictRow struct {
 	At time.Time `bqsink:"at" partition:"day"`
 }
 
+func (metadataConflictRow) BigQueryTableMetadata() *bigquery.TableMetadata {
+	return &bigquery.TableMetadata{
+		TimePartitioning: &bigquery.TimePartitioning{Field: "at", Type: bigquery.DayPartitioningType},
+	}
+}
+
+// TestTaggedLayoutConflictingWithMetadataIsRejected drives resolveTableMetadata
+// rather than New, since the metadata now comes from a method on the row type and
+// one type cannot stand for several contradictions at once. The case a row type
+// really can reach is covered end to end below.
 func TestTaggedLayoutConflictingWithMetadataIsRejected(t *testing.T) {
 	t.Parallel()
 
@@ -404,12 +414,137 @@ func TestTaggedLayoutConflictingWithMetadataIsRejected(t *testing.T) {
 				RangePartitioning: &bigquery.RangePartitioning{Field: "at"},
 			},
 		},
+		{
+			name: "Clustering set both ways",
+			md: &bigquery.TableMetadata{
+				Clustering: &bigquery.Clustering{Fields: []string{"second"}},
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			_, err := New[metadataConflictRow](testClient(t), testRelation(), WithTableMetadata(tt.md))
+			plan := planOf[clusteredConflictRow](t)
+			_, err := resolveTableMetadata(tt.md, plan)
+			if err == nil {
+				t.Fatal("resolveTableMetadata() error = nil, want the contradiction to be rejected")
+			}
+			if !strings.Contains(err.Error(), "drop one of them") {
+				t.Errorf("resolveTableMetadata() error = %v, want it to say the two disagree", err)
+			}
+		})
+	}
+}
+
+// clusteredConflictRow tags both a partition and a clustering key, so that a
+// single plan contradicts whichever of the two a metadata sets.
+type clusteredConflictRow struct {
+	At     time.Time `bqsink:"at" partition:"day"`
+	Second string    `bqsink:"second" cluster:"1"`
+}
+
+func TestNewRejectsATypeContradictingItself(t *testing.T) {
+	t.Parallel()
+
+	_, err := New[metadataConflictRow](testClient(t), testRelation())
+	if err == nil {
+		t.Fatal("New() error = nil, want the contradiction between the tag and the method to be rejected")
+	}
+	if !strings.Contains(err.Error(), "drop one of them") {
+		t.Errorf("New() error = %v, want it to say the two disagree", err)
+	}
+}
+
+// tableMetaRow says what the table is without a BigQueryTableMetadata method.
+type tableMetaRow struct {
+	TableMeta `description:"one row per request, including tax" labels:"team=data,env=prod,owner="`
+
+	UserID string `bqsink:"user_id"`
+}
+
+func TestTableMetaDescribesTheTable(t *testing.T) {
+	t.Parallel()
+
+	s, err := New[tableMetaRow](testClient(t), testRelation())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if s.metadata == nil {
+		t.Fatal("metadata = nil, want the one the embedded TableMeta describes")
+	}
+	if got, want := s.metadata.Description, "one row per request, including tax"; got != want {
+		t.Errorf("Description = %q, want %q", got, want)
+	}
+	want := map[string]string{"team": "data", "env": "prod", "owner": ""}
+	if got := s.metadata.Labels; !reflect.DeepEqual(got, want) {
+		t.Errorf("Labels = %v, want %v", got, want)
+	}
+}
+
+func TestTableMetaContributesNoColumn(t *testing.T) {
+	t.Parallel()
+
+	s, err := New[tableMetaRow](testClient(t), testRelation())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	want := bigquery.Schema{{Name: "user_id", Type: bigquery.StringFieldType}}
+	if got := s.Schema(); !reflect.DeepEqual(got, want) {
+		t.Errorf("Schema() = %s, want %s", formatSchema(got), formatSchema(want))
+	}
+}
+
+// tableMetaConflictRow says the same thing twice, once in a tag and once in the
+// method.
+type tableMetaConflictRow struct {
+	TableMeta `description:"tagged"`
+
+	UserID string `bqsink:"user_id"`
+}
+
+func (tableMetaConflictRow) BigQueryTableMetadata() *bigquery.TableMetadata {
+	return &bigquery.TableMetadata{Description: "from the method"}
+}
+
+// labelConflictRow tags labels the method also sets.
+type labelConflictRow struct {
+	TableMeta `labels:"team=data"`
+
+	UserID string `bqsink:"user_id"`
+}
+
+func (labelConflictRow) BigQueryTableMetadata() *bigquery.TableMetadata {
+	return &bigquery.TableMetadata{Labels: map[string]string{"env": "prod"}}
+}
+
+func TestTableMetaContradictingTheMethodIsRejected(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		fn   func(*bigquery.Client) error
+	}{
+		{
+			name: "a description set both ways",
+			fn: func(c *bigquery.Client) error {
+				_, err := New[tableMetaConflictRow](c, testRelation())
+				return err
+			},
+		},
+		{
+			name: "labels set both ways",
+			fn: func(c *bigquery.Client) error {
+				_, err := New[labelConflictRow](c, testRelation())
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := tt.fn(testClient(t))
 			if err == nil {
 				t.Fatal("New() error = nil, want the contradiction to be rejected")
 			}
@@ -420,13 +555,87 @@ func TestTaggedLayoutConflictingWithMetadataIsRejected(t *testing.T) {
 	}
 }
 
-func TestClusteringConflictingWithMetadataIsRejected(t *testing.T) {
+func TestTableMetaRejectsColumnTags(t *testing.T) {
 	t.Parallel()
 
-	md := &bigquery.TableMetadata{Clustering: &bigquery.Clustering{Fields: []string{"second"}}}
-	_, err := New[clusterOrderRow](testClient(t), testRelation(), WithTableMetadata(md))
-	if err == nil {
-		t.Fatal("New() error = nil, want the contradiction to be rejected")
+	tests := []struct {
+		name string
+		tag  reflect.StructTag
+	}{
+		{name: "the column tag", tag: `bqsink:"meta"`},
+		{name: "a partition tag", tag: `partition:"day"`},
+		{name: "a cluster tag", tag: `cluster:"1"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			// The type is built here rather than declared, so that one case does not
+			// need a named type of its own.
+			rowType := reflect.StructOf([]reflect.StructField{
+				{Name: "TableMeta", Type: reflect.TypeFor[TableMeta](), Tag: tt.tag, Anonymous: true},
+				{Name: "UserID", Type: reflect.TypeFor[string](), Tag: `bqsink:"user_id"`},
+			})
+			_, err := buildRowPlan(rowType, nil)
+			if err == nil {
+				t.Fatal("buildRowPlan() error = nil, want the column tag on TableMeta to be rejected")
+			}
+			if !strings.Contains(err.Error(), "TableMeta is not one") {
+				t.Errorf("buildRowPlan() error = %v, want it to say TableMeta is no column", err)
+			}
+		})
+	}
+}
+
+func TestLabelsTagIsCheckedForShape(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "a pair with no equals sign", value: "team", want: "want key=value"},
+		{name: "an empty key", value: "=data", want: "whose key is empty"},
+		{name: "the same key twice", value: "team=data,team=other", want: "twice"},
+		{name: "an empty tag", value: "", want: "want key=value"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := parseLabels(tt.value)
+			if err == nil {
+				t.Fatalf("parseLabels(%q) error = nil, want a rejection", tt.value)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("parseLabels(%q) error = %v, want it to mention %q", tt.value, err, tt.want)
+			}
+		})
+	}
+}
+
+// nestedTableMetaRow reaches a TableMeta through another embedded struct, which is
+// deliberately not searched.
+type nestedTableMetaRow struct {
+	tableMetaCarrier
+
+	UserID string `bqsink:"user_id"`
+}
+
+type tableMetaCarrier struct {
+	TableMeta `description:"not read from here"`
+}
+
+func TestTableMetaIsOnlyReadFromADirectField(t *testing.T) {
+	t.Parallel()
+
+	s, err := New[nestedTableMetaRow](testClient(t), testRelation())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if s.metadata != nil {
+		t.Errorf("metadata = %+v, want nil for a TableMeta reached through an embedded struct", s.metadata)
 	}
 }
 

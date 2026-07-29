@@ -30,7 +30,7 @@ import (
 // whose definition is out of reach, such as those from another package.
 //
 // RECORD is not accepted, because its nested schema cannot be derived from a
-// field type alone; declare such a column with WithSchema.
+// field type alone; spell such a column out in BigQueryTableMetadata.
 type FieldMarshaler interface {
 	// BigQueryFieldType returns the type of the column this value becomes.
 	BigQueryFieldType() bigquery.FieldType
@@ -68,7 +68,7 @@ type typeMarshaler struct {
 // keeps the mapping registered last.
 //
 // RECORD is not a usable fieldType, because its nested schema cannot be derived
-// from a field type alone; declare such a column with WithSchema.
+// from a field type alone; spell such a column out in BigQueryTableMetadata.
 //
 // A problem with the arguments is reported when the result reaches
 // WithMarshalers or InferSchema, since a constructor cannot return an error and

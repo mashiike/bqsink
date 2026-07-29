@@ -81,7 +81,7 @@ func TestOpenErrorIsCached(t *testing.T) {
 	}}
 	sentinel := errors.New("cannot open")
 	strategy := &fakeWriteStrategy{writer: &fakeRowWriter{}, openErr: sentinel}
-	s := newTestSinker[nestedRow](t, fake, WithMigration(AppendNewColumns{}), WithWriteStrategy(strategy))
+	s := newTestSinker[nestedRow](t, fake, WithMigrationStrategy(AppendNewColumns{}), WithWriteStrategy(strategy))
 
 	ctx := t.Context()
 	for i := range 2 {
@@ -107,7 +107,7 @@ func TestAppendErrorSurfaces(t *testing.T) {
 	sentinel := errors.New("append refused")
 	writer := &fakeRowWriter{appendErr: sentinel}
 	s := newTestSinker[nestedRow](t, fake,
-		WithMigration(AppendNewColumns{}),
+		WithMigrationStrategy(AppendNewColumns{}),
 		WithWriteStrategy(&fakeWriteStrategy{writer: writer}),
 	)
 
@@ -285,7 +285,7 @@ func TestSinkRetriesATransientAppendFailure(t *testing.T) {
 
 	writer := &flakyRowWriter{failAppends: 2, appendErr: unavailableErr()}
 	s := newTestSinker[nestedRow](t, migratedTable(),
-		WithMigration(AppendNewColumns{}),
+		WithMigrationStrategy(AppendNewColumns{}),
 		WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
 	)
 
@@ -306,7 +306,7 @@ func TestSinkDoesNotRetryAPermanentFailure(t *testing.T) {
 
 	writer := &flakyRowWriter{failAppends: 1, appendErr: forbiddenErr()}
 	s := newTestSinker[nestedRow](t, migratedTable(),
-		WithMigration(AppendNewColumns{}),
+		WithMigrationStrategy(AppendNewColumns{}),
 		WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
 	)
 
@@ -323,7 +323,7 @@ func TestSinkGivesUpAfterTheRetryLimit(t *testing.T) {
 
 	writer := &flakyRowWriter{failAppends: 99, appendErr: unavailableErr()}
 	s := newTestSinker[nestedRow](t, migratedTable(),
-		WithMigration(AppendNewColumns{}),
+		WithMigrationStrategy(AppendNewColumns{}),
 		WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
 	)
 
@@ -340,7 +340,7 @@ func TestFlushRetriesATransientFailure(t *testing.T) {
 
 	writer := &flakyRowWriter{failFlushes: 1, appendErr: unavailableErr()}
 	s := newTestSinker[nestedRow](t, migratedTable(),
-		WithMigration(AppendNewColumns{}),
+		WithMigrationStrategy(AppendNewColumns{}),
 		WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
 	)
 
@@ -361,7 +361,7 @@ func TestSinkAllRetriesEachRow(t *testing.T) {
 
 	writer := &flakyRowWriter{failAppends: 1, appendErr: unavailableErr()}
 	s := newTestSinker[nestedRow](t, migratedTable(),
-		WithMigration(AppendNewColumns{}),
+		WithMigrationStrategy(AppendNewColumns{}),
 		WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
 	)
 

@@ -33,10 +33,97 @@ const (
 	// BigQuery can prune.
 	ClusterTagKey = "cluster"
 
-	// DescriptionTagKey documents the column. It is a key of its own because a
-	// description may contain the commas and spaces a comma-separated tag cannot.
+	// DescriptionTagKey documents the column, or the table itself when it is on an
+	// embedded TableMeta. It is a key of its own because a description may contain
+	// the commas and spaces a comma-separated tag cannot.
 	DescriptionTagKey = "description"
+
+	// LabelsTagKey carries the table's labels as a "key=value,key=value" list. It
+	// is only read from an embedded TableMeta, since a label describes the table
+	// rather than any one column.
+	LabelsTagKey = "labels"
 )
+
+// TableMeta lets a row type settle what describes the table as a whole, through
+// tags on the embedded field, so that a description or a set of labels needs no
+// BigQueryTableMetadata method.
+//
+// It contributes no column. Embed it as a direct field of the row type:
+//
+//	type AccessLog struct {
+//		bqsink.TableMeta `description:"one row per request" labels:"team=data,env=prod"`
+//
+//		Timestamp time.Time `bqsink:"timestamp,required" partition:"day"`
+//		UserID    string    `bqsink:"user_id"`
+//	}
+//
+// Only DescriptionTagKey and LabelsTagKey are read here. Anything describing a
+// column, including the column tag itself, is rejected rather than ignored, since
+// TableMeta has no column to apply it to. Declaring the same thing here and in
+// BigQueryTableMetadata is an error rather than one silently winning.
+type TableMeta struct{}
+
+// tableMetaTag is what an embedded TableMeta says about the table.
+type tableMetaTag struct {
+	description string
+	labels      map[string]string
+}
+
+// tableMetaOf reads the tags on an embedded TableMeta.
+//
+// Only a direct field of the row type counts. A TableMeta reached through another
+// embedded struct is left alone, so that what the table is can be read off the row
+// type itself rather than assembled from the types it embeds.
+func tableMetaOf(t reflect.Type) (tableMetaTag, error) {
+	marker := reflect.TypeFor[TableMeta]()
+	for i := range t.NumField() {
+		sf := t.Field(i)
+		if !sf.Anonymous || sf.Type != marker {
+			continue
+		}
+		for _, key := range []string{TagKey, PartitionTagKey, ClusterTagKey} {
+			if _, ok := sf.Tag.Lookup(key); ok {
+				return tableMetaTag{}, fmt.Errorf(
+					"the embedded TableMeta carries the %q tag, which describes a column and TableMeta is not one", key)
+			}
+		}
+		out := tableMetaTag{description: sf.Tag.Get(DescriptionTagKey)}
+		if v, ok := sf.Tag.Lookup(LabelsTagKey); ok {
+			labels, err := parseLabels(v)
+			if err != nil {
+				return tableMetaTag{}, err
+			}
+			out.labels = labels
+		}
+		return out, nil
+	}
+	return tableMetaTag{}, nil
+}
+
+// parseLabels reads a "key=value,key=value" list.
+//
+// Neither separator needs escaping: BigQuery documents a label's key and value as
+// holding only lowercase letters, digits, underscores and dashes, so a comma or an
+// equals sign cannot appear inside one. Whether the characters are allowed is left
+// to BigQuery, which owns that rule; what is checked here is the shape of the list.
+// A value may be empty, which BigQuery allows, but a key may not.
+func parseLabels(v string) (map[string]string, error) {
+	labels := make(map[string]string)
+	for _, pair := range strings.Split(v, ",") {
+		key, value, ok := strings.Cut(pair, "=")
+		switch {
+		case !ok:
+			return nil, fmt.Errorf("the %q tag holds %q, want key=value", LabelsTagKey, pair)
+		case key == "":
+			return nil, fmt.Errorf("the %q tag holds %q, whose key is empty", LabelsTagKey, pair)
+		}
+		if _, duplicate := labels[key]; duplicate {
+			return nil, fmt.Errorf("the %q tag names %q twice", LabelsTagKey, key)
+		}
+		labels[key] = value
+	}
+	return labels, nil
+}
 
 // maxClusteringColumns is BigQuery's limit, confirmed by asking it to create a
 // table with five: "5 clustering fields specified, exceeding the limit of 4".
@@ -143,8 +230,9 @@ const maxClusteringColumns = 4
 // takes the column type it declares instead of any of the above.
 //
 // Types with no representation at all, including uint, uint64, uintptr, a map
-// with non-string keys, channels and functions, produce an error. Use WithSchema
-// for columns none of this can express.
+// with non-string keys, channels and functions, produce an error. Give the row
+// type a BigQueryTableMetadata method spelling the schema out for columns none of
+// this can express.
 func InferSchema[T any](marshalers ...*Marshalers) (bigquery.Schema, error) {
 	plan, err := buildRowPlan(reflect.TypeFor[T](), joinMarshalers(marshalers))
 	if err != nil {

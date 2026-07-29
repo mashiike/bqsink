@@ -133,6 +133,11 @@ type rowPlan struct {
 	partitioning  *bigquery.TimePartitioning
 	clustering    *bigquery.Clustering
 	requireFilter bool
+
+	// description and labels describe the table as well, and come from an embedded
+	// TableMeta rather than from a column.
+	description string
+	labels      map[string]string
 }
 
 // fieldPlan is the plan for one column.
@@ -172,7 +177,11 @@ func buildRowPlanFor(t reflect.Type, marshalers *Marshalers) (*rowPlan, error) {
 	if err != nil {
 		return nil, err
 	}
-	plan := &rowPlan{goType: t}
+	meta, err := tableMetaOf(t)
+	if err != nil {
+		return nil, fmt.Errorf("bqsink: %s: %w", t, err)
+	}
+	plan := &rowPlan{goType: t, description: meta.description, labels: meta.labels}
 	for _, c := range candidates {
 		f, err := buildFieldPlan(c, marshalers)
 		if err != nil {

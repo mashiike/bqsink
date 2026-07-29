@@ -169,7 +169,7 @@ func TestMigrateCreatesMissingTable(t *testing.T) {
 	t.Run("a strategy without CreateIfMissing reports it missing", func(t *testing.T) {
 		t.Parallel()
 		fake := &fakeTable{metadataErr: notFoundErr()}
-		s := newTestSinker[simpleRow](t, fake, WithMigration(MigrationNone{}))
+		s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(MigrationNone{}))
 
 		err := s.Migrate(context.Background())
 		if !errors.Is(err, ErrTableMissing) {
@@ -183,7 +183,7 @@ func TestMigrateCreatesMissingTable(t *testing.T) {
 	t.Run("CreateIfMissing creates it with the declared schema and metadata", func(t *testing.T) {
 		t.Parallel()
 		fake := &fakeTable{metadataErr: notFoundErr()}
-		s := newTestSinker[definedRow](t, fake, WithMigration(AppendNewColumns{CreateIfMissing: true}))
+		s := newTestSinker[definedRow](t, fake, WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}))
 
 		if err := s.Migrate(context.Background()); err != nil {
 			t.Fatalf("Migrate() error = %v", err)
@@ -203,7 +203,7 @@ func TestMigrateCreatesMissingTable(t *testing.T) {
 	t.Run("a create failure surfaces", func(t *testing.T) {
 		t.Parallel()
 		fake := &fakeTable{metadataErr: notFoundErr(), createErr: forbiddenErr()}
-		s := newTestSinker[simpleRow](t, fake, WithMigration(MigrationNone{CreateIfMissing: true}))
+		s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(MigrationNone{CreateIfMissing: true}))
 
 		if err := s.Migrate(context.Background()); err == nil {
 			t.Fatal("Migrate() error = nil, want the create failure")
@@ -220,7 +220,7 @@ func TestMigratePatchesSchema(t *testing.T) {
 			ETag:   "etag-1",
 			Schema: bigquery.Schema{{Name: "Name", Type: bigquery.StringFieldType}},
 		}}
-		s := newTestSinker[simpleRow](t, fake, WithMigration(AppendNewColumns{}))
+		s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(AppendNewColumns{}))
 
 		if err := s.Migrate(context.Background()); err != nil {
 			t.Fatalf("Migrate() error = %v", err)
@@ -250,7 +250,7 @@ func TestMigratePatchesSchema(t *testing.T) {
 				{Name: "Count", Type: bigquery.IntegerFieldType},
 			},
 		}}
-		s := newTestSinker[simpleRow](t, fake, WithMigration(AppendNewColumns{}))
+		s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(AppendNewColumns{}))
 
 		if err := s.Migrate(context.Background()); err != nil {
 			t.Fatalf("Migrate() error = %v", err)
@@ -269,7 +269,7 @@ func TestMigratePatchesSchema(t *testing.T) {
 				{Name: "Count", Type: bigquery.IntegerFieldType},
 			},
 		}}
-		s := newTestSinker[simpleRow](t, fake, WithMigration(AppendNewColumns{}))
+		s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(AppendNewColumns{}))
 
 		err := s.Migrate(context.Background())
 		if !errors.Is(err, ErrSchemaConflict) {
@@ -286,7 +286,7 @@ func TestMigratePatchesSchema(t *testing.T) {
 			ETag:   "etag-1",
 			Schema: bigquery.Schema{{Name: "user_id", Type: bigquery.StringFieldType, Required: true}},
 		}}
-		s := newTestSinker[taggedRow](t, fake, WithMigration(AppendNewColumns{}))
+		s := newTestSinker[taggedRow](t, fake, WithMigrationStrategy(AppendNewColumns{}))
 
 		err := s.Migrate(context.Background())
 		if !errors.Is(err, ErrSchemaConflict) {
@@ -307,7 +307,7 @@ func TestMigratePatchesSchema(t *testing.T) {
 				{Name: "legacy", Type: bigquery.StringFieldType},
 			},
 		}}
-		s := newTestSinker[simpleRow](t, fake, WithMigration(SyncAllColumns{}))
+		s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(SyncAllColumns{}))
 
 		if err := s.Migrate(t.Context()); err != nil {
 			t.Fatalf("Migrate() error = %v", err)
@@ -333,7 +333,7 @@ func TestMigratePatchesSchema(t *testing.T) {
 				{Name: "legacy", Type: bigquery.StringFieldType},
 			},
 		}}
-		s := newTestSinker[simpleRow](t, fake, WithMigration(SyncAllColumns{}))
+		s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(SyncAllColumns{}))
 
 		if err := s.Migrate(t.Context()); err != nil {
 			t.Fatalf("Migrate() error = %v", err)
@@ -366,7 +366,7 @@ func TestMigratePatchesSchema(t *testing.T) {
 				{Name: "bad`name", Type: bigquery.StringFieldType},
 			},
 		}}
-		s := newTestSinker[simpleRow](t, fake, WithMigration(SyncAllColumns{}))
+		s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(SyncAllColumns{}))
 
 		if err := s.Migrate(t.Context()); err == nil {
 			t.Fatal("Migrate() error = nil, want a refusal to interpolate the name")
@@ -385,7 +385,7 @@ func TestMigratePatchesSchema(t *testing.T) {
 				{Name: "legacy", Type: bigquery.StringFieldType},
 			},
 		}}
-		s := newTestSinker[simpleRow](t, fake, WithMigration(SyncAllColumns{IgnoreColumns: []string{"legacy"}}))
+		s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(SyncAllColumns{IgnoreColumns: []string{"legacy"}}))
 
 		if err := s.Migrate(context.Background()); err != nil {
 			t.Fatalf("Migrate() error = %v", err)
@@ -419,7 +419,7 @@ func TestMigrateRetriesConcurrentChange(t *testing.T) {
 		t.Parallel()
 		fake := driftedTable()
 		fake.updateErrs = []error{etagErr(), etagErr(), nil}
-		s := newTestSinker[simpleRow](t, fake, WithMigration(AppendNewColumns{}))
+		s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(AppendNewColumns{}))
 
 		if err := s.Migrate(context.Background()); err != nil {
 			t.Fatalf("Migrate() error = %v", err)
@@ -437,7 +437,7 @@ func TestMigrateRetriesConcurrentChange(t *testing.T) {
 		t.Parallel()
 		fake := driftedTable()
 		fake.updateErrs = []error{etagErr(), etagErr(), etagErr(), etagErr(), etagErr(), etagErr()}
-		s := newTestSinker[simpleRow](t, fake, WithMigration(AppendNewColumns{}))
+		s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(AppendNewColumns{}))
 
 		if err := s.Migrate(context.Background()); err == nil {
 			t.Fatal("Migrate() error = nil, want the last etag failure")
@@ -451,7 +451,7 @@ func TestMigrateRetriesConcurrentChange(t *testing.T) {
 		t.Parallel()
 		fake := driftedTable()
 		fake.updateErrs = []error{forbiddenErr(), nil}
-		s := newTestSinker[simpleRow](t, fake, WithMigration(AppendNewColumns{}))
+		s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(AppendNewColumns{}))
 
 		if err := s.Migrate(context.Background()); err == nil {
 			t.Fatal("Migrate() error = nil, want the permission failure")
@@ -474,7 +474,7 @@ func TestMigrateRunsOnce(t *testing.T) {
 				{Name: "Count", Type: bigquery.IntegerFieldType},
 			},
 		}}
-		s := newTestSinker[simpleRow](t, fake, WithMigration(AppendNewColumns{}))
+		s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(AppendNewColumns{}))
 
 		for i := range 3 {
 			if err := s.Migrate(context.Background()); err != nil {
@@ -510,7 +510,7 @@ func TestSinkRequiresMigration(t *testing.T) {
 
 	ctx := context.Background()
 	fake := &fakeTable{metadataErr: notFoundErr()}
-	s := newTestSinker[simpleRow](t, fake, WithMigration(MigrationNone{}))
+	s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(MigrationNone{}))
 
 	if err := s.Sink(ctx, simpleRow{}); !errors.Is(err, ErrTableMissing) {
 		t.Errorf("Sink() error = %v, want the migration failure wrapping ErrTableMissing", err)

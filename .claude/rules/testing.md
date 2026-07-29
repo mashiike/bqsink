@@ -22,7 +22,7 @@ paths:
 
 `newTestSinker` が `api` と `query` に fake を挿し、**`WriteStrategy` にも fake を既定で入れる**（呼び出し側が渡せば上書きされる）。既定の `StorageWrite` は実接続を試みるので、この既定がないと `Sink` を呼ぶテストが GCP を叩く。
 
-既定の戦略が `AppendNewColumns{CreateIfMissing: true}` になったことで、**`Migrate` が成功して `Open` まで進むテストが増えた**。`ErrTableMissing` を検査したいテストは `WithMigration(MigrationNone{})` を明示する。
+既定の戦略が `AppendNewColumns{CreateIfMissing: true}` になったことで、**`Migrate` が成功して `Open` まで進むテストが増えた**。`ErrTableMissing` を検査したいテストは `WithMigrationStrategy(MigrationNone{})` を明示する。
 
 `bigquery.NewClient(ctx, "test-project", option.WithoutAuthentication())` で認証なしの client が作れる。`New` が I/O しない設計なので、構築部分はこれでテストできる。
 
