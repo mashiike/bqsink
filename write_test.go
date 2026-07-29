@@ -3,6 +3,7 @@ package bqsink
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"testing"
 
@@ -16,7 +17,7 @@ type fakeWriteStrategy struct {
 	openErr error
 }
 
-func (s *fakeWriteStrategy) Open(ctx context.Context, table *bigquery.Table, schema bigquery.Schema) (RowWriter, error) {
+func (s *fakeWriteStrategy) Open(_ context.Context, table *bigquery.Table, schema bigquery.Schema, logger *slog.Logger) (RowWriter, error) {
 	if s.openErr != nil {
 		return nil, s.openErr
 	}
@@ -25,6 +26,7 @@ func (s *fakeWriteStrategy) Open(ctx context.Context, table *bigquery.Table, sch
 	s.writer.opens++
 	s.writer.openedSchema = schema
 	s.writer.openedTable = table
+	s.writer.openedLogger = logger
 	return s.writer, nil
 }
 
@@ -34,6 +36,7 @@ type fakeRowWriter struct {
 	opens        int
 	openedSchema bigquery.Schema
 	openedTable  *bigquery.Table
+	openedLogger *slog.Logger
 
 	rows      []map[string]bigquery.Value
 	appendErr error
@@ -118,7 +121,7 @@ func TestLoadJobsOpenDoesNotFail(t *testing.T) {
 
 	table := &bigquery.Table{ProjectID: "p", DatasetID: "d", TableID: "t"}
 	schema := bigquery.Schema{{Name: "a", Type: bigquery.StringFieldType}}
-	w, err := (&LoadJobs{}).Open(t.Context(), table, schema)
+	w, err := (&LoadJobs{}).Open(t.Context(), table, schema, discardLogger())
 	if err != nil {
 		t.Fatalf("Open() error = %v, want nil since it contacts nothing", err)
 	}
@@ -218,7 +221,7 @@ type flakyWriteStrategy struct {
 	writer *flakyRowWriter
 }
 
-func (s *flakyWriteStrategy) Open(ctx context.Context, table *bigquery.Table, schema bigquery.Schema) (RowWriter, error) {
+func (s *flakyWriteStrategy) Open(_ context.Context, _ *bigquery.Table, _ bigquery.Schema, _ *slog.Logger) (RowWriter, error) {
 	return s.writer, nil
 }
 
@@ -393,7 +396,7 @@ type recordingFlakyStrategy struct {
 	writer *recordingFlakyWriter
 }
 
-func (s *recordingFlakyStrategy) Open(ctx context.Context, table *bigquery.Table, schema bigquery.Schema) (RowWriter, error) {
+func (s *recordingFlakyStrategy) Open(_ context.Context, _ *bigquery.Table, _ bigquery.Schema, _ *slog.Logger) (RowWriter, error) {
 	return s.writer, nil
 }
 

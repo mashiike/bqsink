@@ -361,6 +361,29 @@ bqsink.WithRetryPolicy(func() gax.Retryer {
 **Writes are at-least-once.** A retry can deliver a row twice and neither transport
 deduplicates.
 
+## Logging
+
+```go
+bqsink.WithLogger(slog.Default())
+```
+
+Nothing is logged without it. The default discards every record rather than writing
+to the embedding program's `slog.Default()` uninvited. Every record names the
+relation.
+
+| Level | What it reports |
+|---|---|
+| `Debug` | the difference `Migrate` found, the stream that was opened, the rows a flush carried |
+| `Info` | a change made to the table, and a load job submitted and finished |
+| `Warn` | something bqsink let pass |
+
+**`Error` is unused.** A failure is returned, and logging it as well would report it
+twice. What `Warn` is for is the opposite case, where nothing is returned and the
+record is the only trace: a failure a retry got past, a schema difference the
+strategy chose to leave alone, a column drop, or a failure that had to give way to
+a worse one — such as a stream that would not close after rows had already been
+lost.
+
 ## Testing
 
 ```

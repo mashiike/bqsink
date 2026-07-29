@@ -432,7 +432,7 @@ func TestMigrationStrategyPlan(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			change, err := tt.strategy.Plan(tt.state)
+			change, err := tt.strategy.Plan(tt.state, discardLogger())
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
 					t.Fatalf("Plan() error = %v, want one wrapping %v", err, tt.wantErr)
@@ -488,7 +488,7 @@ func TestMergeSchema(t *testing.T) {
 		{Name: "a", Type: bigquery.StringFieldType, Required: true},
 		{Name: "legacy", Type: bigquery.StringFieldType},
 	}
-	change, err := AppendNewColumns{}.Plan(TableState{Exists: true, Diff: DiffSchema(declared, table)})
+	change, err := AppendNewColumns{}.Plan(TableState{Exists: true, Diff: DiffSchema(declared, table)}, discardLogger())
 	if err != nil {
 		t.Fatalf("Plan() error = %v", err)
 	}

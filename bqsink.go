@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"strings"
 	"sync"
@@ -92,6 +93,7 @@ type Sinker[T any] struct {
 	strategy      MigrationStrategy
 	writeStrategy WriteStrategy
 	retryPolicy   func() gax.Retryer
+	logger        *slog.Logger
 
 	sinkerID  string
 	createdAt time.Time
@@ -169,6 +171,11 @@ func New[T any](client *bigquery.Client, relation Relation, opts ...Option) (*Si
 	if retryPolicy == nil {
 		retryPolicy = DefaultRetryPolicy
 	}
+	logger := c.logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	logger = logger.With(slog.String("relation", relation.String()))
 	filler, err := rowFillerOf[T]()
 	if err != nil {
 		return nil, err
@@ -190,6 +197,7 @@ func New[T any](client *bigquery.Client, relation Relation, opts ...Option) (*Si
 		strategy:      strategy,
 		writeStrategy: writeStrategy,
 		retryPolicy:   retryPolicy,
+		logger:        logger,
 		sinkerID:      sinkerID,
 		createdAt:     time.Now(),
 		filler:        filler,
@@ -326,7 +334,7 @@ func (s *Sinker[T]) Relation() Relation {
 // Sink calls Migrate on its first invocation, so calling it directly is only
 // necessary to apply schema changes ahead of time, such as during a deploy.
 func (s *Sinker[T]) Migrate(ctx context.Context) error {
-	s.migrateOnce.Do(func() { s.migrateErr = s.migrateWithRetry(ctx) })
+	s.migrateOnce.Do(func() { s.migrateErr = s.retrying(ctx, "migrate", s.migrate) })
 	return s.migrateErr
 }
 
@@ -349,7 +357,7 @@ func (s *Sinker[T]) Sink(ctx context.Context, v T) error {
 	if err != nil {
 		return err
 	}
-	return s.retrying(ctx, func(ctx context.Context) error {
+	return s.retrying(ctx, "append", func(ctx context.Context) error {
 		return w.Append(ctx, row)
 	})
 }
@@ -371,7 +379,7 @@ func (s *Sinker[T]) SinkAll(ctx context.Context, vs ...T) error {
 		if err != nil {
 			return err
 		}
-		err = s.retrying(ctx, func(ctx context.Context) error {
+		err = s.retrying(ctx, "append", func(ctx context.Context) error {
 			return w.Append(ctx, row)
 		})
 		if err != nil {
@@ -412,10 +420,25 @@ func (s *Sinker[T]) appendInfo() (AppendInfo, error) {
 	}, nil
 }
 
-// retrying runs op under the configured retry policy, the same one Migrate uses.
-func (s *Sinker[T]) retrying(ctx context.Context, op func(context.Context) error) error {
+// retrying runs op, named by what for the log, under the configured retry policy.
+//
+// A failure that is retried is logged, because a later attempt succeeding leaves
+// the caller with no sign that it happened. It is logged on the way into the next
+// attempt rather than when it is returned, so that the failure op finally returns
+// is reported once, by the caller, and not logged here as well.
+func (s *Sinker[T]) retrying(ctx context.Context, what string, op func(context.Context) error) error {
+	var attempt int
+	var lastErr error
 	call := func(ctx context.Context, _ gax.CallSettings) error {
-		return op(ctx)
+		if lastErr != nil {
+			s.logger.WarnContext(ctx, "retrying after a failure a later attempt may get past",
+				slog.String("operation", what),
+				slog.Int("attempt", attempt),
+				slog.Any("error", lastErr))
+		}
+		attempt++
+		lastErr = op(ctx)
+		return lastErr
 	}
 	return gax.Invoke(ctx, call, gax.WithRetry(s.retryPolicy))
 }
@@ -435,7 +458,7 @@ func (s *Sinker[T]) writer(ctx context.Context) (RowWriter, error) {
 	s.writerMu.Lock()
 	defer s.writerMu.Unlock()
 	if s.rowWriter == nil && s.writerErr == nil {
-		s.rowWriter, s.writerErr = s.writeStrategy.Open(ctx, s.table, s.schema)
+		s.rowWriter, s.writerErr = s.writeStrategy.Open(ctx, s.table, s.schema, s.logger)
 	}
 	return s.rowWriter, s.writerErr
 }
@@ -451,7 +474,7 @@ func (s *Sinker[T]) Flush(ctx context.Context) error {
 	if w == nil {
 		return nil
 	}
-	return s.retrying(ctx, w.Flush)
+	return s.retrying(ctx, "flush", w.Flush)
 }
 
 // Close flushes and releases the write strategy's resources. It does nothing when

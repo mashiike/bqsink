@@ -53,6 +53,7 @@ func testLoadWriter(loader jobLoader, flushRows int, schema bigquery.Schema) *lo
 		schema:     schema,
 		flushRows:  flushRows,
 		flushBytes: DefaultFlushBytes,
+		logger:     discardLogger(),
 	}
 }
 
@@ -402,7 +403,13 @@ func TestLoadJobsFlushesOnSize(t *testing.T) {
 	loader := &fakeLoader{}
 	// One rendered row of abSchema is around 20 bytes, so a small threshold makes
 	// the size trigger rather than the row count.
-	w := &loadJobsWriter{loader: loader, schema: abSchema(), flushRows: 1000, flushBytes: 30}
+	w := &loadJobsWriter{
+		loader:     loader,
+		schema:     abSchema(),
+		flushRows:  1000,
+		flushBytes: 30,
+		logger:     discardLogger(),
+	}
 	ctx := t.Context()
 
 	if err := w.Append(ctx, map[string]bigquery.Value{"A": "first", "B": int64(1)}); err != nil {
@@ -450,7 +457,7 @@ func TestLoadJobsStagesThroughAStager(t *testing.T) {
 
 	stager := &fakeStager{}
 	table := &bigquery.Table{ProjectID: "p", DatasetID: "d", TableID: "t"}
-	w, err := (&LoadJobs{FlushRows: 1, Staging: stager}).Open(t.Context(), table, abSchema())
+	w, err := (&LoadJobs{FlushRows: 1, Staging: stager}).Open(t.Context(), table, abSchema(), discardLogger())
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}

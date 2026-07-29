@@ -9,6 +9,24 @@ paths:
 
 # 転送層
 
+## ログの level は「呼び出し元に返るか」で決まる
+
+**`Error` は使わない。** エラーは戻り値で返しているので、ログにも出すと二重処理になる（`~/.claude/rules/go.md`）。
+
+`Warn` は**返らずに捨てている事象専用**。転送層でそれに当たるのは3箇所しかない。
+
+| 箇所 | 捨てているもの |
+|---|---|
+| `stagedLoader.load` の cleanup | ステージングしたオブジェクトの削除失敗。行はもうロード済み／損失報告済み |
+| `storageWriteWriter.Flush` | 2件目以降の reject。戻り値は `firstErr` 1件だけ |
+| `storageWriteWriter.Close` | 既に失敗があるときの stream / client close 失敗 |
+
+**`_ = err` を書きたくなったら、それは Warn ログの場所。** 逆に、error に情報を含めて返しているもの（`flushLocked` の「N 行を捨てた」）はログにしない。
+
+`Info` は load job の投入と完了だけ。**投入時にもログを出しているのは、`job.Wait` が数秒〜数分ロックを持ったままブロックするので、終わってからしか記録がないと止まって見えるため。**
+
+`RowWriter` を直接構造体リテラルで作るテストは `logger` を埋めること。`Open` の契約で non-nil なので**内部では nil チェックしていない**（`loadjobs_test.go` の直接構築で一度 panic させた）。
+
 ## Storage Write API の proto 型は素直ではない
 
 `adapt` が BQ スキーマから作る proto の型（実測）:

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -84,11 +85,17 @@ func (c SchemaConflict) String() string {
 }
 
 func fieldNames(schema bigquery.Schema) string {
+	return "[" + strings.Join(namesOf(schema), " ") + "]"
+}
+
+// namesOf lists the columns' names, which both a conflict's message and a log
+// record describe a schema by.
+func namesOf(schema bigquery.Schema) []string {
 	names := make([]string, len(schema))
 	for i, f := range schema {
 		names[i] = f.Name
 	}
-	return "[" + strings.Join(names, " ") + "]"
+	return names
 }
 
 // SchemaDiff lists how a declared schema differs from a real table's.
@@ -110,6 +117,39 @@ type SchemaDiff struct {
 // Empty reports whether the declared schema and the table already agree.
 func (d SchemaDiff) Empty() bool {
 	return len(d.Added) == 0 && len(d.Removed) == 0 && len(d.Relaxed) == 0 && len(d.Conflicts) == 0
+}
+
+// mentions returns the named columns d has something to say about, so that a
+// strategy can report which of the columns it leaves alone actually differ.
+func (d SchemaDiff) mentions(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	named := make(map[string]bool, len(names))
+	for _, name := range names {
+		named[name] = true
+	}
+	seen := make(map[string]bool, len(names))
+	var out []string
+	add := func(name string) {
+		if named[name] && !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	for _, f := range d.Added {
+		add(f.Name)
+	}
+	for _, name := range d.Removed {
+		add(name)
+	}
+	for _, name := range d.Relaxed {
+		add(name)
+	}
+	for _, c := range d.Conflicts {
+		add(c.Name)
+	}
+	return out
 }
 
 // Without returns d with every mention of the named columns dropped, letting a
@@ -259,11 +299,17 @@ func (c SchemaChange) Empty() bool {
 // MigrationStrategy decides what to do about the difference between the declared
 // schema and the real table.
 //
-// Plan is a pure function: bqsink reads the table's state, asks the strategy
-// what to change, and applies the answer. An implementation therefore needs no
-// BigQuery access and can be tested on its own.
+// Plan touches nothing: bqsink reads the table's state, asks the strategy what to
+// change, and applies the answer. An implementation therefore needs no BigQuery
+// access and can be tested on its own.
+//
+// logger is the one WithLogger settled on and is never nil. It is there for the
+// one thing the answer cannot express: a difference the strategy decided not to
+// reconcile. Since bqsink is for keeping a table in step with the declaration,
+// leaving a difference alone is worth a record, and the SchemaChange returned no
+// longer mentions it.
 type MigrationStrategy interface {
-	Plan(state TableState) (SchemaChange, error)
+	Plan(state TableState, logger *slog.Logger) (SchemaChange, error)
 }
 
 // MigrationNone leaves an existing table's schema untouched.
@@ -280,12 +326,18 @@ type MigrationNone struct {
 // It asks for no change beyond creating a missing table, but still reports
 // conflicts, because writing to a table whose columns disagree with the
 // declaration would fail anyway.
-func (m MigrationNone) Plan(state TableState) (SchemaChange, error) {
+func (m MigrationNone) Plan(state TableState, logger *slog.Logger) (SchemaChange, error) {
 	if !state.Exists {
 		return SchemaChange{CreateTable: m.CreateIfMissing}, nil
 	}
 	if err := conflictError(state.Diff.Conflicts); err != nil {
 		return SchemaChange{}, err
+	}
+	if !state.Diff.Empty() {
+		logger.Warn("the table differs from the declaration and MigrationNone leaves it as it is",
+			slog.Any("missing_columns", namesOf(state.Diff.Added)),
+			slog.Any("undeclared_columns", state.Diff.Removed),
+			slog.Any("columns_to_relax", state.Diff.Relaxed))
 	}
 	return SchemaChange{}, nil
 }
@@ -303,12 +355,16 @@ type AppendNewColumns struct {
 }
 
 // Plan implements MigrationStrategy.
-func (a AppendNewColumns) Plan(state TableState) (SchemaChange, error) {
+func (a AppendNewColumns) Plan(state TableState, logger *slog.Logger) (SchemaChange, error) {
 	if !state.Exists {
 		return SchemaChange{CreateTable: a.CreateIfMissing}, nil
 	}
 	if err := conflictError(state.Diff.Conflicts); err != nil {
 		return SchemaChange{}, err
+	}
+	if len(state.Diff.Removed) > 0 {
+		logger.Info("the table has columns the declaration does not, and AppendNewColumns keeps them",
+			slog.Any("columns", state.Diff.Removed))
 	}
 	return SchemaChange{
 		AddColumns:   state.Diff.Added,
@@ -338,13 +394,17 @@ func (s SyncAllColumns) Validate() error {
 }
 
 // Plan implements MigrationStrategy.
-func (s SyncAllColumns) Plan(state TableState) (SchemaChange, error) {
+func (s SyncAllColumns) Plan(state TableState, logger *slog.Logger) (SchemaChange, error) {
 	if !state.Exists {
 		return SchemaChange{CreateTable: s.CreateIfMissing}, nil
 	}
 	diff := state.Diff.Without(s.IgnoreColumns)
 	if err := conflictError(diff.Conflicts); err != nil {
 		return SchemaChange{}, err
+	}
+	if ignored := state.Diff.mentions(s.IgnoreColumns); len(ignored) > 0 {
+		logger.Warn("IgnoreColumns holds columns that differ from the declaration, and they are left as they are",
+			slog.Any("columns", ignored))
 	}
 	return SchemaChange{
 		AddColumns:   diff.Added,
@@ -411,14 +471,6 @@ func DefaultRetryPolicy() gax.Retryer {
 	}
 }
 
-// migrateWithRetry retries migrate according to the configured retry policy.
-func (s *Sinker[T]) migrateWithRetry(ctx context.Context) error {
-	call := func(ctx context.Context, _ gax.CallSettings) error {
-		return s.migrate(ctx)
-	}
-	return gax.Invoke(ctx, call, gax.WithRetry(s.retryPolicy))
-}
-
 // attemptLimiter stops retrying after max retries, wrapping a Retryer that
 // decides whether an error is retryable at all.
 type attemptLimiter struct {
@@ -442,12 +494,18 @@ func (s *Sinker[T]) migrate(ctx context.Context) error {
 	switch {
 	case err == nil:
 		state = TableState{Exists: true, Diff: DiffSchema(s.schema, md.Schema)}
+		s.logger.DebugContext(ctx, "compared the declaration with the table",
+			slog.Any("missing_columns", namesOf(state.Diff.Added)),
+			slog.Any("undeclared_columns", state.Diff.Removed),
+			slog.Any("columns_to_relax", state.Diff.Relaxed),
+			slog.Int("conflicts", len(state.Diff.Conflicts)))
 	case isNotFound(err):
 		md = nil
+		s.logger.DebugContext(ctx, "the table does not exist yet")
 	default:
 		return fmt.Errorf("bqsink: read metadata of %s: %w", s.relation, err)
 	}
-	change, err := s.strategy.Plan(state)
+	change, err := s.strategy.Plan(state, s.logger)
 	if err != nil {
 		return fmt.Errorf("bqsink: migrate %s: %w", s.relation, err)
 	}
@@ -462,6 +520,7 @@ func (s *Sinker[T]) apply(ctx context.Context, md *bigquery.TableMetadata, chang
 		return s.createTable(ctx)
 	}
 	if change.Empty() {
+		s.logger.DebugContext(ctx, "the table needs no change")
 		return nil
 	}
 	// Columns are added before any are dropped, so that a failure in between
@@ -480,6 +539,7 @@ func (s *Sinker[T]) createTable(ctx context.Context) error {
 	if err := s.api.Create(ctx, s.newTableMetadata()); err != nil {
 		return fmt.Errorf("bqsink: create %s: %w", s.relation, err)
 	}
+	s.logger.InfoContext(ctx, "created the table", slog.Any("columns", namesOf(s.schema)))
 	return nil
 }
 
@@ -505,6 +565,9 @@ func (s *Sinker[T]) patchSchema(ctx context.Context, md *bigquery.TableMetadata,
 	if _, err := s.api.Update(ctx, bigquery.TableMetadataToUpdate{Schema: next}, md.ETag); err != nil {
 		return fmt.Errorf("bqsink: update schema of %s: %w", s.relation, err)
 	}
+	s.logger.InfoContext(ctx, "brought the table's schema up to the declaration",
+		slog.Any("added_columns", namesOf(change.AddColumns)),
+		slog.Any("relaxed_columns", change.RelaxColumns))
 	return nil
 }
 
@@ -524,6 +587,10 @@ func (s *Sinker[T]) dropColumns(ctx context.Context, names []string) error {
 		return fmt.Errorf("bqsink: drop columns [%s] from %s: %w",
 			strings.Join(names, ", "), s.relation, err)
 	}
+	// Warn rather than Info: this is the one thing bqsink does that destroys data,
+	// and there is no undoing it.
+	s.logger.WarnContext(ctx, "dropped columns, and the data they held is gone",
+		slog.Any("columns", names))
 	return nil
 }
 

@@ -25,12 +25,14 @@ return s.dropColumns(ctx, change.DropColumns)
 
 ## `MigrationStrategy.Plan` は純関数（BigQuery を触らせない）
 
-`Plan(state TableState) (SchemaChange, error)` は「差分のうち何を適用するか決める」だけ。**BigQuery 呼び出しを戦略に持たせない理由が2つある。**
+`Plan(state TableState, logger *slog.Logger) (SchemaChange, error)` は「差分のうち何を適用するか決める」だけ。**BigQuery 呼び出しを戦略に持たせない理由が2つある。**
 
 1. `Metadata` 取得・etag の受け渡し・`Update` の発行・DDL の組み立てが戦略ごとに重複する
 2. 戦略のテストが BigQuery 抜きで書ける。`IgnoreColumns` が効いているかの検証がまさにこれ
 
 流れは `Metadata 取得 → DiffSchema → strategy.Plan → 適用` で、両端は `Sinker` の仕事。
+
+**`logger` を渡しているのは「和解しなかった差分」を報告できる場所が他にないから。** `SchemaChange` は適用するものしか表現しないので、`MigrationNone` が差分を放置したこと・`SyncAllColumns` の `IgnoreColumns` がズレを隠したことは、戻り値からは消える。ズレの検出が中核価値なのでそこだけログにしている。**「純関数」は BigQuery を触らせないという意味で、ログは対象外。** `Plan` に ctx が無いので `WarnContext` ではなく `Warn` を使う。
 
 ## テーブル作成は `SchemaChange.CreateTable` で表現する
 

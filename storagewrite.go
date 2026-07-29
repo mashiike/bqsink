@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 
 	"cloud.google.com/go/bigquery"
@@ -64,7 +65,7 @@ func rowDescriptor(schema bigquery.Schema) (protoreflect.MessageDescriptor, erro
 //
 // It derives the proto descriptor from the schema once, which is possible because
 // Migrate has already settled it, and opens a managedwriter client and stream.
-func (w *StorageWrite) Open(ctx context.Context, table *bigquery.Table, schema bigquery.Schema) (RowWriter, error) {
+func (w *StorageWrite) Open(ctx context.Context, table *bigquery.Table, schema bigquery.Schema, logger *slog.Logger) (RowWriter, error) {
 	descriptor, err := rowDescriptor(schema)
 	if err != nil {
 		return nil, err
@@ -85,11 +86,15 @@ func (w *StorageWrite) Open(ctx context.Context, table *bigquery.Table, schema b
 		}
 		return nil, fmt.Errorf("bqsink: open a write stream for %s: %w", table.FullyQualifiedName(), err)
 	}
+	// The stream name says which kind of stream this is, so its type needs no
+	// attribute of its own; a stream opened by name has a type bqsink cannot tell.
+	logger.DebugContext(ctx, "opened a write stream", slog.String("stream", stream.StreamName()))
 	return &storageWriteWriter{
 		client:     client,
 		stream:     stream,
 		schema:     schema,
 		descriptor: descriptor,
+		logger:     logger,
 	}, nil
 }
 
@@ -120,6 +125,7 @@ type storageWriteWriter struct {
 	stream     *managedwriter.ManagedStream
 	schema     bigquery.Schema
 	descriptor protoreflect.MessageDescriptor
+	logger     *slog.Logger
 
 	mu      sync.Mutex
 	pending []*managedwriter.AppendResult
@@ -160,16 +166,28 @@ func (w *storageWriteWriter) marshalRow(row map[string]bigquery.Value) ([]byte, 
 
 // Flush implements RowWriter. It waits for every append handed over so far and
 // reports the first one BigQuery rejected.
+//
+// Only the first rejection is returned, so the rest are logged: they describe rows
+// that never landed either, and nothing else would say so.
 func (w *storageWriteWriter) Flush(ctx context.Context) error {
 	w.mu.Lock()
 	pending := w.pending
 	w.pending = nil
 	w.mu.Unlock()
 
+	w.logger.DebugContext(ctx, "waiting for the appends handed over so far",
+		slog.Int("appends", len(pending)))
 	var firstErr error
 	for _, result := range pending {
-		if _, err := result.GetResult(ctx); err != nil && firstErr == nil {
+		_, err := result.GetResult(ctx)
+		switch {
+		case err == nil:
+		case firstErr == nil:
 			firstErr = fmt.Errorf("bqsink: an append to %s was rejected: %w", w.stream.StreamName(), err)
+		default:
+			w.logger.WarnContext(ctx, "a further append was rejected as well",
+				slog.String("stream", w.stream.StreamName()),
+				slog.Any("error", err))
 		}
 	}
 	return firstErr
@@ -179,15 +197,26 @@ func (w *storageWriteWriter) Flush(ctx context.Context) error {
 // both the stream and the client, so that neither leaks its gRPC connection.
 //
 // Its error reports rows that never reached BigQuery and must not be discarded.
+// A failure to close is only returned when there is nothing worse to report, since
+// rows that never landed matter more than a connection that did not shut down
+// cleanly; where it gives way it is logged instead.
 func (w *storageWriteWriter) Close(ctx context.Context) error {
 	err := w.Flush(ctx)
 	// managedwriter reports a cleanly closed stream as io.EOF: "For normal
 	// operation, mark the stream error as io.EOF."
-	if serr := w.stream.Close(); serr != nil && !errors.Is(serr, io.EOF) && err == nil {
-		err = fmt.Errorf("bqsink: close the write stream: %w", serr)
+	if serr := w.stream.Close(); serr != nil && !errors.Is(serr, io.EOF) {
+		if err == nil {
+			err = fmt.Errorf("bqsink: close the write stream: %w", serr)
+		} else {
+			w.logger.WarnContext(ctx, "could not close the write stream", slog.Any("error", serr))
+		}
 	}
-	if cerr := w.client.Close(); cerr != nil && err == nil {
-		err = fmt.Errorf("bqsink: close the Storage Write API client: %w", cerr)
+	if cerr := w.client.Close(); cerr != nil {
+		if err == nil {
+			err = fmt.Errorf("bqsink: close the Storage Write API client: %w", cerr)
+		} else {
+			w.logger.WarnContext(ctx, "could not close the Storage Write API client", slog.Any("error", cerr))
+		}
 	}
 	return err
 }

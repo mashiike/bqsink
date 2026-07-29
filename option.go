@@ -3,6 +3,7 @@ package bqsink
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"cloud.google.com/go/bigquery"
 	gax "github.com/googleapis/gax-go/v2"
@@ -34,6 +35,7 @@ type config struct {
 	strategy      MigrationStrategy
 	writeStrategy WriteStrategy
 	retryPolicy   func() gax.Retryer
+	logger        *slog.Logger
 }
 
 // Option configures a Sinker at construction time.
@@ -130,6 +132,30 @@ func WithWriteStrategy(s WriteStrategy) Option {
 			return err
 		}
 		c.writeStrategy = s
+		return nil
+	}
+}
+
+// WithLogger sends what bqsink has to say to logger, with the relation as an
+// attribute on every record.
+//
+// Without it nothing is logged at all: the default discards every record, so
+// bqsink does not write to an embedding program's slog.Default() uninvited.
+//
+// Three levels are used and Error is not among them, since a failure is returned
+// rather than logged.
+//
+//	Debug  what a transport did: the stream it opened, the rows it flushed, the
+//	       difference Migrate found
+//	Info   a change bqsink made to the table, and a load job it ran
+//	Warn   something bqsink had to let pass: a failure it could not return, or a
+//	       difference the migration strategy chose not to reconcile
+func WithLogger(logger *slog.Logger) Option {
+	return func(c *config) error {
+		if logger == nil {
+			return errors.New("bqsink: WithLogger: logger is nil")
+		}
+		c.logger = logger
 		return nil
 	}
 }

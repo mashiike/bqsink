@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
+	"time"
 
 	"cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
@@ -32,7 +34,12 @@ type WriteStrategy interface {
 	// Open returns a RowWriter for table. Migrate has already reconciled the
 	// schema by this point, so an implementation may derive a descriptor from it
 	// once and keep it for the writer's lifetime.
-	Open(ctx context.Context, table *bigquery.Table, schema bigquery.Schema) (RowWriter, error)
+	//
+	// logger is the one WithLogger settled on, already carrying the relation, and
+	// it is never nil. A writer is expected to keep it and describe what it does
+	// with it, since an error it returns is the caller's to report and a failure
+	// it has to swallow would otherwise leave no trace.
+	Open(ctx context.Context, table *bigquery.Table, schema bigquery.Schema, logger *slog.Logger) (RowWriter, error)
 }
 
 // StorageWrite writes rows through the BigQuery Storage Write API.
@@ -174,16 +181,17 @@ func (w *LoadJobs) Validate() error {
 
 // Open implements WriteStrategy. It contacts BigQuery only when a load job is
 // submitted, so opening never fails.
-func (w *LoadJobs) Open(ctx context.Context, table *bigquery.Table, schema bigquery.Schema) (RowWriter, error) {
-	var loader jobLoader = tableLoader{table: table}
+func (w *LoadJobs) Open(_ context.Context, table *bigquery.Table, schema bigquery.Schema, logger *slog.Logger) (RowWriter, error) {
+	var loader jobLoader = tableLoader{table: table, logger: logger}
 	if w.Staging != nil {
-		loader = stagedLoader{table: table, stager: w.Staging}
+		loader = stagedLoader{table: table, stager: w.Staging, logger: logger}
 	}
 	return &loadJobsWriter{
 		loader:     loader,
 		schema:     schema,
 		flushRows:  w.flushRows(),
 		flushBytes: w.flushBytes(),
+		logger:     logger,
 	}, nil
 }
 
@@ -194,7 +202,8 @@ type jobLoader interface {
 }
 
 type tableLoader struct {
-	table *bigquery.Table
+	table  *bigquery.Table
+	logger *slog.Logger
 }
 
 // load submits a load job with an explicit schema and CreateNever, leaving the
@@ -203,19 +212,23 @@ func (l tableLoader) load(ctx context.Context, rows []byte, schema bigquery.Sche
 	source := bigquery.NewReaderSource(bytes.NewReader(rows))
 	source.SourceFormat = bigquery.JSON
 	source.Schema = schema
-	return runLoader(ctx, l.table, source)
+	return runLoader(ctx, l.table, source, l.logger)
 }
 
 // runLoader submits the load job and waits for it, with an explicit schema and
 // CreateNever so that the table's shape is left entirely to Migrate.
-func runLoader(ctx context.Context, table *bigquery.Table, source bigquery.LoadSource) error {
+func runLoader(ctx context.Context, table *bigquery.Table, source bigquery.LoadSource, logger *slog.Logger) error {
 	loader := table.LoaderFrom(source)
 	loader.WriteDisposition = bigquery.WriteAppend
 	loader.CreateDisposition = bigquery.CreateNever
+	started := time.Now()
 	job, err := loader.Run(ctx)
 	if err != nil {
 		return fmt.Errorf("bqsink: submit load job for %s: %w", table.FullyQualifiedName(), err)
 	}
+	// The wait below takes seconds to minutes and holds the writer's lock, so the
+	// job is worth reporting before it rather than only once it is over.
+	logger.InfoContext(ctx, "submitted a load job", slog.String("job", job.ID()))
 	status, err := job.Wait(ctx)
 	if err != nil {
 		return fmt.Errorf("bqsink: wait for load job %s: %w", job.ID(), err)
@@ -223,6 +236,11 @@ func runLoader(ctx context.Context, table *bigquery.Table, source bigquery.LoadS
 	if err := status.Err(); err != nil {
 		return fmt.Errorf("bqsink: load job %s failed: %w", job.ID(), err)
 	}
+	// Measured from before the submission, since what the caller waited for is the
+	// whole thing and not the job's own runtime.
+	logger.InfoContext(ctx, "the load job finished",
+		slog.String("job", job.ID()),
+		slog.Duration("elapsed", time.Since(started)))
 	return nil
 }
 
@@ -231,6 +249,7 @@ func runLoader(ctx context.Context, table *bigquery.Table, source bigquery.LoadS
 type stagedLoader struct {
 	table  *bigquery.Table
 	stager Stager
+	logger *slog.Logger
 }
 
 func (l stagedLoader) load(ctx context.Context, rows []byte, schema bigquery.Schema) error {
@@ -238,19 +257,25 @@ func (l stagedLoader) load(ctx context.Context, rows []byte, schema bigquery.Sch
 	if err != nil {
 		return fmt.Errorf("bqsink: stage rows for %s: %w", l.table.FullyQualifiedName(), err)
 	}
+	l.logger.DebugContext(ctx, "staged the rows for a load job",
+		slog.String("uri", uri),
+		slog.Int("bytes", len(rows)))
 	if cleanup != nil {
 		defer func() {
+			// The rows are already loaded or already reported as lost, so a failure
+			// to tidy up is not worth overriding that with; it is only logged, and
+			// what is left behind needs removing by hand.
 			if cerr := cleanup(ctx); cerr != nil {
-				// The rows are already loaded or already reported as lost, so a
-				// failure to tidy up is not worth overriding that with.
-				_ = cerr
+				l.logger.WarnContext(ctx, "could not remove the staged rows",
+					slog.String("uri", uri),
+					slog.Any("error", cerr))
 			}
 		}()
 	}
 	source := bigquery.NewGCSReference(uri)
 	source.SourceFormat = bigquery.JSON
 	source.Schema = schema
-	return runLoader(ctx, l.table, source)
+	return runLoader(ctx, l.table, source, l.logger)
 }
 
 type loadJobsWriter struct {
@@ -258,6 +283,7 @@ type loadJobsWriter struct {
 	schema     bigquery.Schema
 	flushRows  int
 	flushBytes int
+	logger     *slog.Logger
 
 	mu   sync.Mutex
 	buf  bytes.Buffer
@@ -306,6 +332,9 @@ func (w *loadJobsWriter) flushLocked(ctx context.Context) error {
 	count := w.rows
 	w.buf.Reset()
 	w.rows = 0
+	w.logger.DebugContext(ctx, "flushing the buffered rows",
+		slog.Int("rows", count),
+		slog.Int("bytes", len(rows)))
 	if err := w.loader.load(ctx, rows, w.schema); err != nil {
 		return fmt.Errorf("%w: %d buffered row(s) were dropped", err, count)
 	}
