@@ -1,9 +1,17 @@
 // Package bqsink writes rows to BigQuery and keeps the destination table's
 // schema in sync with a schema declared in Go code.
 //
-// The schema is declared up front, either by struct tags on T or by an explicit
-// bigquery.Schema. The declaration is the source of truth: the real table
-// follows it. bqsink never infers a schema from the data being written.
+// The declaration is the source of truth: the real table follows it, and bqsink
+// never infers a schema from the data being written. What the table looks like is
+// said by the row type and nowhere else — its struct tags, and its
+// BigQueryTableMetadata method for what tags cannot express. No Option describes
+// the table, since a row type carries the domain knowledge that gives its columns
+// meaning, and two places to say what a table is means two answers to keep
+// agreeing.
+//
+// The Options settle how bqsink behaves around that declaration: what to do about a
+// difference between it and the real table, how rows travel, what gets logged, and
+// how a transient failure is retried.
 package bqsink
 
 import (
@@ -497,6 +505,10 @@ func (s *Sinker[T]) Flush(ctx context.Context) error {
 // Close flushes and releases the write strategy's resources. It does nothing when
 // no row has been handed over yet.
 //
+// The flush goes through Flush, so a transient failure is retried under the retry
+// policy the same way it is anywhere else. This is the last chance the rows get,
+// which is why it is not left to the writer's own Close.
+//
 // Like Flush, its error reports rows that never reached BigQuery. A plain
 // "defer s.Close(ctx)" throws that away and loses the rows silently; capture it
 // through a named return value instead.
@@ -510,10 +522,18 @@ func (s *Sinker[T]) Flush(ctx context.Context) error {
 //		...
 //	}
 func (s *Sinker[T]) Close(ctx context.Context) error {
-	if w := s.openedWriter(); w != nil {
-		return w.Close(ctx)
+	w := s.openedWriter()
+	if w == nil {
+		return nil
 	}
-	return nil
+	err := s.Flush(ctx)
+	// The writer is closed whether or not the flush got through, so that a failure
+	// cannot leak the transport's connections. Rows that never landed matter more
+	// than an unclean shutdown, so the flush's error is the one that survives.
+	if cerr := w.Close(ctx); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 func (s *Sinker[T]) openedWriter() RowWriter {

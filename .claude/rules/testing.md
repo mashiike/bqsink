@@ -49,7 +49,7 @@ BQSINK_TEST_PROJECT=... BQSINK_TEST_BUCKET=... go test ./...  # + GCS
 | `BQSINK_TEST_DATASET` | `bqsink_integration_test` を使う（無ければ作る） |
 | `BQSINK_TEST_BUCKET` | GCS ステージングの3件だけ Skip |
 
-**プロジェクト ID もバケット名もソースに入れない。** 汎用の `GOOGLE_CLOUD_PROJECT` を使わないのは、他のツール用に設定されているだけで意図せずテーブルが作られて課金されるのを避けるため。
+**プロジェクト ID もバケット名もソースに入れない。** 環境変数だけで受け取り、未設定なら Skip する。汎用の `GOOGLE_CLOUD_PROJECT` を使わないのは、他のツール用に設定されているだけで意図せずテーブルが作られて課金されるのを避けるため。
 
 ## ビルドタグを使わない
 

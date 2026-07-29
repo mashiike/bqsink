@@ -237,6 +237,8 @@ type flakyRowWriter struct {
 
 	failFlushes int
 	flushes     int
+
+	closed bool
 }
 
 func (w *flakyRowWriter) Append(ctx context.Context, row map[string]bigquery.Value) error {
@@ -262,12 +264,25 @@ func (w *flakyRowWriter) Flush(ctx context.Context) error {
 	return nil
 }
 
-func (w *flakyRowWriter) Close(ctx context.Context) error { return nil }
+// Close flushes the way a real writer's does, so that what the Sinker asks of it
+// can be counted.
+func (w *flakyRowWriter) Close(ctx context.Context) error {
+	w.mu.Lock()
+	w.closed = true
+	w.mu.Unlock()
+	return w.Flush(ctx)
+}
 
 func (w *flakyRowWriter) counts() (appends, flushes, rows int) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.appends, w.flushes, len(w.rows)
+}
+
+func (w *flakyRowWriter) wasClosed() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.closed
 }
 
 func migratedTable() *fakeTable {
@@ -353,6 +368,50 @@ func TestFlushRetriesATransientFailure(t *testing.T) {
 	}
 	if _, flushes, _ := writer.counts(); flushes != 2 {
 		t.Errorf("Flush was called %d times, want 2 (one failure then a success)", flushes)
+	}
+}
+
+func TestCloseRetriesATransientFlushFailure(t *testing.T) {
+	t.Parallel()
+
+	writer := &flakyRowWriter{failFlushes: 1, appendErr: unavailableErr()}
+	s := newTestSinker[nestedRow](t, migratedTable(),
+		WithMigrationStrategy(AppendNewColumns{}),
+		WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
+	)
+
+	ctx := t.Context()
+	if err := s.Sink(ctx, nestedRow{}); err != nil {
+		t.Fatalf("Sink() error = %v", err)
+	}
+	if err := s.Close(ctx); err != nil {
+		t.Fatalf("Close() error = %v, want the retry to save the rows", err)
+	}
+	// Two from the retried flush Close asks for, and one more from the writer's own
+	// Close, which flushes an empty buffer.
+	if _, flushes, _ := writer.counts(); flushes != 3 {
+		t.Errorf("Flush was called %d times, want 3 (one failure, one success, then the writer's own Close)", flushes)
+	}
+}
+
+func TestCloseClosesTheWriterEvenWhenTheFlushFails(t *testing.T) {
+	t.Parallel()
+
+	writer := &flakyRowWriter{failFlushes: 99, appendErr: unavailableErr()}
+	s := newTestSinker[nestedRow](t, migratedTable(),
+		WithMigrationStrategy(AppendNewColumns{}),
+		WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
+	)
+
+	ctx := t.Context()
+	if err := s.Sink(ctx, nestedRow{}); err != nil {
+		t.Fatalf("Sink() error = %v", err)
+	}
+	if err := s.Close(ctx); err == nil {
+		t.Fatal("Close() error = nil, want the failure that lost the rows")
+	}
+	if !writer.wasClosed() {
+		t.Error("the writer was not closed, which leaks the transport's connections")
 	}
 }
 

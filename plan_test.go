@@ -702,8 +702,10 @@ func TestSinkWritesThroughTheWriteStrategy(t *testing.T) {
 	if !reflect.DeepEqual(writer.rows, want) {
 		t.Errorf("appended rows = %#v, want %#v", writer.rows, want)
 	}
-	if writer.flushes != 1 {
-		t.Errorf("Flush was called %d times, want 1", writer.flushes)
+	// Twice: the explicit Flush, and the one Close puts under the retry policy so
+	// that the rows it is holding get one more chance.
+	if writer.flushes != 2 {
+		t.Errorf("Flush was called %d times, want 2 (the explicit one and the one Close asks for)", writer.flushes)
 	}
 	if writer.closes != 1 {
 		t.Errorf("Close was called %d times, want 1", writer.closes)

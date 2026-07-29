@@ -45,6 +45,26 @@ return s.Flush(ctx)
 `Close` and `Flush` report rows that never reached BigQuery, so a bare
 `defer s.Close(ctx)` loses them silently. Capture the error as above.
 
+## Options
+
+`New` takes five, and **none of them describes the table.** What the table looks
+like belongs to the row type; these settle how bqsink behaves around that.
+
+| Option | Default | Section |
+|---|---|---|
+| `WithMigrationStrategy` | `AppendNewColumns{CreateIfMissing: true}` | [Migration](#migration) |
+| `WithWriteStrategy` | `&StorageWrite{}` | [Transports](#transports) |
+| `WithMarshalers` | no overrides | [Custom column types](#custom-column-types) |
+| `WithRetryPolicy` | four retries, 200ms to 5s | [Retries](#retries) |
+| `WithLogger` | records are discarded | [Logging](#logging) |
+
+A strategy is configured with a struct literal rather than more options, so that its
+settings never look like one:
+
+```go
+bqsink.WithWriteStrategy(&bqsink.LoadJobs{FlushRows: 5000})
+```
+
 ## Declaring the schema
 
 Struct tags describe the columns. Columns are **NULLABLE by default**, unlike
@@ -386,6 +406,10 @@ bqsink.WithWriteStrategy(&bqsink.LoadJobs{
 A transient failure is retried under one policy, shared by `Migrate` and the write
 path: a concurrent change to the table, a rate limit, or a server side failure,
 over either HTTP or gRPC. Four retries with jittered backoff between 200ms and 5s.
+
+`Close` flushes through the same retry, since the rows it is holding get no later
+chance. The writer is closed whether or not that flush gets through, so a failure
+cannot leak the transport's connections, and the flush's error is the one returned.
 
 ```go
 bqsink.WithRetryPolicy(func() gax.Retryer {

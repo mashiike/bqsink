@@ -63,6 +63,24 @@ TIMESTAMP:           int64（推奨）, int32, uint32, google.protobuf.Timestamp
 
 `StreamName` が設定されているときは `WithDestinationTable` を付けない。既存ストリームは既にテーブルに紐づいているため。
 
+## `Sinker.Close` は writer の `Close` に flush を任せない
+
+`RowWriter` の実装は3つとも `Close` の中で flush する（`loadJobsWriter.Close` は `Flush` そのもの、`storageWriteWriter.Close` は pending append を待ってから stream を閉じる）。**それでも `Sinker.Close` は先に `s.Flush(ctx)` を呼ぶ。**
+
+理由は**リトライ**。`Sinker.Flush` は `retrying` を通るが、`w.Close` を直接呼ぶ経路にはリトライが無く、**一時エラー（503 等）で最後の flush が1回で諦めて行が消えていた**（`loadJobsWriter.flushLocked` は失敗時もバッファを捨てる）。2026-07-29 に修正。
+
+```go
+err := s.Flush(ctx)          // リトライされる
+if cerr := w.Close(ctx); err == nil { err = cerr }   // 失敗しても必ず閉じる
+return err
+```
+
+- **flush が失敗しても `w.Close` を呼ぶ。** 呼ばないと gRPC の stream と client が漏れる
+- **返すのは flush のエラーを優先。** 行が着かなかったことの方が、閉じ損なったことより重い
+- **flush は2回走る**（`w.Close` の中でもう1回）。2回目はバッファが空なので実質 no-op。`RowWriter.Close` の契約を「flush しない」に変える方法もあるが、利用者が `RowWriter` を自作したときに flush 忘れで行が消える方が怖いのでこの形にした
+
+`write_test.go` の `TestCloseRetriesATransientFlushFailure` と `TestCloseClosesTheWriterEvenWhenTheFlushFails` が両方を守っている。
+
 ## `ManagedStream.Close()` が返す `io.EOF` は正常終了
 
 ソースにそう書いてある。
