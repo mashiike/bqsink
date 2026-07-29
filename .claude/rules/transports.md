@@ -63,6 +63,12 @@ TIMESTAMP:           int64（推奨）, int32, uint32, google.protobuf.Timestamp
 
 `StreamName` が設定されているときは `WithDestinationTable` を付けない。既存ストリームは既にテーブルに紐づいているため。
 
+## 行を失いうる公開メソッドは全てリトライ対象にする
+
+`Sink` / `SinkAll` / `Flush` / `Migrate` / `Close` のうち、**`Close` だけがリトライ対象から漏れていた**（下記）。メソッドを追加するときはこの不変条件を確認する。「行が BigQuery に着かないまま失敗しうる経路」が `retrying` を通っていなければ、一時エラー1回で行が消える。
+
+`fakeRowWriter.Close` が flush しない一方、実 writer は3つとも flush していたため、**fake が本物より弱くて経路差がテストに現れなかった**のが検出漏れの原因。テストダブルを実装より弱くしない。
+
 ## `Sinker.Close` は writer の `Close` に flush を任せない
 
 `RowWriter` の実装は3つとも `Close` の中で flush する（`loadJobsWriter.Close` は `Flush` そのもの、`storageWriteWriter.Close` は pending append を待ってから stream を閉じる）。**それでも `Sinker.Close` は先に `s.Flush(ctx)` を呼ぶ。**

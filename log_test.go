@@ -84,16 +84,6 @@ func (r *recorder) only(t *testing.T, level slog.Level, message string) slog.Rec
 	return found[0]
 }
 
-// first returns the earliest record with the given level and message.
-func (r *recorder) first(t *testing.T, level slog.Level, message string) slog.Record {
-	t.Helper()
-	found := r.matching(level, message)
-	if len(found) == 0 {
-		t.Fatalf("no record of %s %q; logged: %s", level, message, r.summary())
-	}
-	return found[0]
-}
-
 func (r *recorder) count(level slog.Level, message string) int {
 	return len(r.matching(level, message))
 }

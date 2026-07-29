@@ -213,7 +213,9 @@ write rather than at `CREATE TABLE`:
 - `partition:"hour"` on a DATE column — the one granularity DATE cannot carry
 - more than four clustering columns, a repeated position, or a gap in the positions
 - clustering on FLOAT, JSON, BYTES or a repeated column
-- `require` with nothing partitioned, which BigQuery accepts but cannot act on
+
+`require` needs no check of its own: it is written inside the `partition` tag, so
+there is no way to ask for a partition filter without a partitioning column.
 
 ### Table level settings
 

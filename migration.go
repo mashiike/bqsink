@@ -286,8 +286,10 @@ type SchemaChange struct {
 	// RelaxColumns names columns to turn from REQUIRED into NULLABLE.
 	RelaxColumns []string
 
-	// DropColumns names columns to drop. Dropping is not implemented yet, so a
-	// non-empty value makes Migrate return an error wrapping ErrNotImplemented.
+	// DropColumns names columns to drop with an ALTER TABLE statement, which
+	// destroys the data they hold irreversibly. They are dropped after AddColumns
+	// and RelaxColumns have been applied, so that a failure in between leaves the
+	// table holding more than the declaration asks for rather than less.
 	DropColumns []string
 }
 

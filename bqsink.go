@@ -29,9 +29,6 @@ import (
 )
 
 var (
-	// ErrNotImplemented reports that a code path has not been implemented yet.
-	ErrNotImplemented = errors.New("bqsink: not implemented")
-
 	// ErrSchemaConflict reports that reconciling the declared schema with the
 	// real table needs a change BigQuery does not allow, such as altering a
 	// column's type or making a NULLABLE column REQUIRED.

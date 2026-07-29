@@ -391,12 +391,6 @@ func (s *fakeStager) Stage(ctx context.Context, rows []byte) (string, func(conte
 
 func (s *fakeStager) Validate() error { return s.validate }
 
-func (s *fakeStager) snapshot() (staged []string, cleanups int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.staged, s.cleanups
-}
-
 func TestLoadJobsFlushesOnSize(t *testing.T) {
 	t.Parallel()
 

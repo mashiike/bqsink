@@ -230,9 +230,6 @@ func (p *rowPlan) resolveLayout(candidates []candidateField) error {
 		byPosition[tag.cluster] = f.name
 	}
 	if len(byPosition) == 0 {
-		if p.requireFilter && p.partitioning == nil {
-			return fmt.Errorf("the %q option needs a partitioning column", "require")
-		}
 		return nil
 	}
 	// The positions have to run 1..n, since a gap means a column was meant to be

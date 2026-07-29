@@ -355,12 +355,6 @@ func TestLayoutIsValidated(t *testing.T) {
 	}
 }
 
-// requireWithoutPartitionRow asks for a partition filter with nothing partitioned.
-// BigQuery accepts that combination, but it cannot mean anything.
-type requireWithoutPartitionRow struct {
-	A string `bqsink:"a"`
-}
-
 func TestNewAppliesTheTaggedLayout(t *testing.T) {
 	t.Parallel()
 
