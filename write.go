@@ -6,26 +6,41 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
+	gax "github.com/googleapis/gax-go/v2"
 	"google.golang.org/api/option"
 )
 
-// RowWriter accepts rows and sends them to BigQuery.
+// Row is one row on its way to BigQuery.
+type Row struct {
+	// ID identifies the row. It is what a transport names the row by when it has
+	// something to say about it, and it is the value the _ingestion_row_id column
+	// gets when the row type fills that column in.
+	//
+	// It plays no part in reporting what could not be written: the count WriteRows
+	// returns is what says that.
+	ID string
+
+	// Values are the columns to write.
+	Values map[string]bigquery.Value
+}
+
+// RowWriter sends rows to BigQuery. Retrying a transient failure is its
+// responsibility, since it is the one holding the rows while they are in flight.
 //
 // An implementation must be safe for concurrent use, because a Sinker is and
 // hands its writer straight to the caller's goroutines.
 type RowWriter interface {
-	// Append hands a row over for writing. It may buffer rather than send.
-	Append(ctx context.Context, row map[string]bigquery.Value) error
+	// WriteRows writes rows in order and returns how many of them it wrote.
+	//
+	// It must return a non-nil error when n < len(rows), so that rows[n:] are
+	// exactly the rows that did not land. It must not retain rows after returning.
+	WriteRows(ctx context.Context, rows []Row) (n int, err error)
 
-	// Flush sends whatever is buffered.
-	Flush(ctx context.Context) error
-
-	// Close flushes and then releases the writer's resources.
+	// Close releases what the writer holds.
 	Close(ctx context.Context) error
 }
 
@@ -44,10 +59,19 @@ type WriteStrategy interface {
 
 // StorageWrite writes rows through the BigQuery Storage Write API.
 //
-// Append hands the row to BigQuery and keeps the pending result rather than
-// waiting for it, so a rejected row surfaces from Flush or Close rather than from
-// the Append that sent it. Their errors therefore report rows that never landed
-// and must not be discarded.
+// Each WriteRows sends the rows as one append and waits for BigQuery to accept
+// them, so throughput comes from how many rows a single Sink is given rather than
+// from overlapping appends. An append is all or nothing: BigQuery appends none of
+// the rows in a request it rejects.
+//
+// BigQuery caps how large an append request may be, and StorageWrite does not split
+// one, so a batch past that cap is rejected rather than divided. Where batches are
+// large enough for that to be a worry, LoadJobs is the transport for them.
+//
+// Retrying is left to the client library's own automatic retries, which suit
+// at-least-once delivery. The number of attempts is therefore the library's to
+// decide, so StorageWrite has no policy to set the way LoadJobs does; what it has
+// is DisableWriteRetries, for turning them off.
 type StorageWrite struct {
 	// StreamType selects the kind of stream to create. The zero value means
 	// managedwriter.DefaultStream, which appends immediately and at least once.
@@ -62,13 +86,24 @@ type StorageWrite struct {
 	// StreamType is ignored when it is set.
 	StreamName string
 
+	// DisableWriteRetries stops bqsink from turning the client library's automatic
+	// write retries on. The zero value leaves them on, since a row that never lands
+	// is what bqsink is for; turn them off where an append being sent twice matters
+	// more than it arriving, which is the exactly-once pattern the client library
+	// warns they complicate.
+	//
+	// It says what bqsink does rather than what the stream ends up doing: the client
+	// library has no way to switch retries back off, so an EnableWriteRetries(true)
+	// of your own in WriterOptions still stands.
+	DisableWriteRetries bool
+
 	// ClientOptions configure the managedwriter client.
 	ClientOptions []option.ClientOption
 
-	// WriterOptions configure the stream. bqsink applies these first and then
-	// sets the destination table and the schema descriptor itself, so an option
-	// naming either of those has no effect: the relation and the declared schema
-	// are the source of truth.
+	// WriterOptions configure the stream. bqsink applies these first and then sets
+	// the destination table and the schema descriptor itself, so an option naming
+	// either of those has no effect: the relation and the declared schema are the
+	// source of truth.
 	WriterOptions []managedwriter.WriterOption
 }
 
@@ -88,22 +123,6 @@ func (w *StorageWrite) Validate() error {
 	return fmt.Errorf("StorageWrite: unknown StreamType %q", w.StreamType)
 }
 
-// DefaultFlushRows is how many rows LoadJobs buffers before submitting a load
-// job, used when FlushRows is not set.
-//
-// BigQuery caps how many load jobs a table accepts per day, so a small threshold
-// exhausts that budget on a busy table. The exact cap is not verified here.
-const DefaultFlushRows = 10000
-
-// DefaultFlushBytes is how much buffered JSON makes LoadJobs submit a load job
-// regardless of the row count, used when FlushBytes is not set.
-//
-// This is about the writer's own memory rather than a BigQuery limit: the client
-// library uploads with a resumable request and splits it into chunks itself, so
-// the request size is not what needs bounding. What needs bounding is the buffer,
-// which holds every row until it is flushed.
-const DefaultFlushBytes = 32 << 20
-
 // Stager puts the rows somewhere a load job can read them, instead of uploading
 // them with the job itself.
 //
@@ -117,60 +136,47 @@ type Stager interface {
 	Stage(ctx context.Context, rows []byte) (uri string, cleanup func(context.Context) error, err error)
 }
 
-// LoadJobs writes rows by buffering them as newline delimited JSON and
-// submitting BigQuery load jobs.
+// LoadJobs writes rows by rendering them as newline delimited JSON and submitting
+// a BigQuery load job.
 //
-// A load job is submitted synchronously, so the Append that reaches FlushRows,
-// and every Flush and Close, blocks until BigQuery finishes the job. That takes
-// seconds to minutes, and it happens while the writer's lock is held, so
-// concurrent calls to Sink wait for it. This is a batch transport; use
-// StorageWrite where rows should land as they arrive.
+// One WriteRows is one load job, so how many rows a job carries is decided by how
+// many rows a single Sink is given. LoadJobs does not accumulate rows across calls:
+// writing them one at a time submits a load job each time, which a table's daily
+// job quota will not stand for. Give Sink a whole batch, or accumulate before it.
 //
-// A transient failure is retried by the Sinker under its retry policy. Rows still
-// buffered when a load job finally fails are dropped, so that a table which keeps
-// rejecting them cannot make the buffer grow without bound; the error says how
-// many were lost. Only Flush and Close report whether the rows they were holding
-// reached BigQuery, so their errors matter.
+// A load job is submitted synchronously, so every WriteRows blocks until BigQuery
+// finishes the job, which takes seconds to minutes. Nothing is serialised on a
+// lock, so concurrent calls submit concurrent jobs.
+//
+// A load job is all or nothing: WriteRows returns len(rows) or, having retried
+// under RetryPolicy, 0 and an error. Rows are never left half written.
 //
 // Rows are uploaded with the load job itself unless Staging is set. Set it to
 // bqgcs.Staging to put them in Cloud Storage first, which suits large batches.
 type LoadJobs struct {
-	// FlushRows submits a load job once this many rows are buffered. The zero
-	// value means DefaultFlushRows.
-	FlushRows int
-
-	// FlushBytes submits a load job once the buffered JSON reaches this size,
-	// whatever the row count. The zero value means DefaultFlushBytes. A single row
-	// larger than this is still written, in a batch of its own.
-	FlushBytes int
-
 	// Staging, when set, writes the rows through a Stager and has the load job
 	// read them from there instead of carrying them itself.
 	Staging Stager
+
+	// RetryPolicy decides how a load job that failed in a way a later attempt
+	// could get past is retried. The zero value means DefaultRetryPolicy; set it
+	// to a policy of your own to change that, and note that returning a bare
+	// gax.OnErrorFunc places no limit on the number of attempts.
+	//
+	// It is called once per WriteRows, because a gax.Retryer carries the state of
+	// its backoff and cannot be reused.
+	RetryPolicy func() gax.Retryer
 }
 
-func (w *LoadJobs) flushRows() int {
-	if w.FlushRows <= 0 {
-		return DefaultFlushRows
+func (w *LoadJobs) retryPolicy() func() gax.Retryer {
+	if w.RetryPolicy == nil {
+		return DefaultRetryPolicy
 	}
-	return w.FlushRows
-}
-
-func (w *LoadJobs) flushBytes() int {
-	if w.FlushBytes <= 0 {
-		return DefaultFlushBytes
-	}
-	return w.FlushBytes
+	return w.RetryPolicy
 }
 
 // Validate implements Validator.
 func (w *LoadJobs) Validate() error {
-	if w.FlushRows < 0 {
-		return fmt.Errorf("LoadJobs: FlushRows is %d, want zero for the default or a positive count", w.FlushRows)
-	}
-	if w.FlushBytes < 0 {
-		return fmt.Errorf("LoadJobs: FlushBytes is %d, want zero for the default or a positive size", w.FlushBytes)
-	}
 	if v, ok := w.Staging.(Validator); ok {
 		if err := v.Validate(); err != nil {
 			return fmt.Errorf("LoadJobs: %w", err)
@@ -187,16 +193,15 @@ func (w *LoadJobs) Open(_ context.Context, table *bigquery.Table, schema bigquer
 		loader = stagedLoader{table: table, stager: w.Staging, logger: logger}
 	}
 	return &loadJobsWriter{
-		loader:     loader,
-		schema:     schema,
-		flushRows:  w.flushRows(),
-		flushBytes: w.flushBytes(),
-		logger:     logger,
+		loader:      loader,
+		schema:      schema,
+		retryPolicy: w.retryPolicy(),
+		logger:      logger,
 	}, nil
 }
 
-// jobLoader submits the buffered rows and waits for BigQuery to finish. It exists
-// so that the buffering can be tested without BigQuery.
+// jobLoader submits the rows and waits for BigQuery to finish. It exists so that
+// the writer can be tested without BigQuery.
 type jobLoader interface {
 	load(ctx context.Context, rows []byte, schema bigquery.Schema) error
 }
@@ -226,8 +231,8 @@ func runLoader(ctx context.Context, table *bigquery.Table, source bigquery.LoadS
 	if err != nil {
 		return fmt.Errorf("bqsink: submit load job for %s: %w", table.FullyQualifiedName(), err)
 	}
-	// The wait below takes seconds to minutes and holds the writer's lock, so the
-	// job is worth reporting before it rather than only once it is over.
+	// The wait below takes seconds to minutes, so the job is worth reporting before
+	// it rather than only once it is over.
 	logger.InfoContext(ctx, "submitted a load job", slog.String("job", job.ID()))
 	status, err := job.Wait(ctx)
 	if err != nil {
@@ -262,9 +267,9 @@ func (l stagedLoader) load(ctx context.Context, rows []byte, schema bigquery.Sch
 		slog.Int("bytes", len(rows)))
 	if cleanup != nil {
 		defer func() {
-			// The rows are already loaded or already reported as lost, so a failure
-			// to tidy up is not worth overriding that with; it is only logged, and
-			// what is left behind needs removing by hand.
+			// The rows are already loaded or already reported as undelivered, so a
+			// failure to tidy up is not worth overriding that with; it is only logged,
+			// and what is left behind needs removing by hand.
 			if cerr := cleanup(ctx); cerr != nil {
 				l.logger.WarnContext(ctx, "could not remove the staged rows",
 					slog.String("uri", uri),
@@ -278,65 +283,43 @@ func (l stagedLoader) load(ctx context.Context, rows []byte, schema bigquery.Sch
 	return runLoader(ctx, l.table, source, l.logger)
 }
 
+// loadJobsWriter holds nothing that changes, so concurrent writes need no lock.
 type loadJobsWriter struct {
-	loader     jobLoader
-	schema     bigquery.Schema
-	flushRows  int
-	flushBytes int
-	logger     *slog.Logger
-
-	mu   sync.Mutex
-	buf  bytes.Buffer
-	rows int
+	loader      jobLoader
+	schema      bigquery.Schema
+	retryPolicy func() gax.Retryer
+	logger      *slog.Logger
 }
 
-// Append implements RowWriter. It buffers the row, submitting a load job once
-// FlushRows rows are held.
-func (w *loadJobsWriter) Append(ctx context.Context, row map[string]bigquery.Value) error {
-	line, err := encodeJSONRow(row, w.schema)
+// WriteRows implements RowWriter. It submits one load job for rows and returns
+// len(rows) once BigQuery has finished it.
+func (w *loadJobsWriter) WriteRows(ctx context.Context, rows []Row) (int, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	var buf bytes.Buffer
+	for i := range rows {
+		line, err := encodeJSONRow(rows[i].Values, w.schema)
+		if err != nil {
+			return 0, err
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	w.logger.DebugContext(ctx, "loading rows",
+		slog.Int("rows", len(rows)),
+		slog.Int("bytes", buf.Len()))
+	err := retrying(ctx, w.logger, "load", w.retryPolicy, func(ctx context.Context) error {
+		return w.loader.load(ctx, buf.Bytes(), w.schema)
+	})
 	if err != nil {
-		return err
+		return 0, err
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.buf.Write(line)
-	w.buf.WriteByte('\n')
-	w.rows++
-	if w.rows < w.flushRows && w.buf.Len() < w.flushBytes {
-		return nil
-	}
-	return w.flushLocked(ctx)
+	return len(rows), nil
 }
 
-// Flush implements RowWriter.
-func (w *loadJobsWriter) Flush(ctx context.Context) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.flushLocked(ctx)
-}
-
-// Close implements RowWriter. It flushes, so its error reports rows that never
-// reached BigQuery and must not be discarded.
-func (w *loadJobsWriter) Close(ctx context.Context) error {
-	return w.Flush(ctx)
-}
-
-// flushLocked submits the buffered rows and clears the buffer either way, so that
-// a failing table cannot make it grow without bound. The rows are lost, which the
-// returned error reports.
-func (w *loadJobsWriter) flushLocked(ctx context.Context) error {
-	if w.rows == 0 {
-		return nil
-	}
-	rows := bytes.Clone(w.buf.Bytes())
-	count := w.rows
-	w.buf.Reset()
-	w.rows = 0
-	w.logger.DebugContext(ctx, "flushing the buffered rows",
-		slog.Int("rows", count),
-		slog.Int("bytes", len(rows)))
-	if err := w.loader.load(ctx, rows, w.schema); err != nil {
-		return fmt.Errorf("%w: %d buffered row(s) were dropped", err, count)
-	}
+// Close implements RowWriter. A load job holds nothing once it has finished, so
+// there is nothing to release.
+func (w *loadJobsWriter) Close(context.Context) error {
 	return nil
 }

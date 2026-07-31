@@ -254,14 +254,14 @@ func TestIntegrationLoadJobs(t *testing.T) {
 	relation := integrationRelation(t, client, projectID, datasetID)
 
 	s, err := New[integrationRow](client, relation,
-		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
 	ctx := context.Background()
-	if err := s.Sink(ctx, sampleIntegrationRow("load")); err != nil {
+	if _, err := s.Sink(ctx, sampleIntegrationRow("load")); err != nil {
 		t.Fatalf("Sink() error = %v", err)
 	}
 	if err := s.Close(ctx); err != nil {
@@ -284,14 +284,14 @@ func TestIntegrationStorageWrite(t *testing.T) {
 	relation := integrationRelation(t, client, projectID, datasetID)
 
 	s, err := New[integrationRow](client, relation,
-		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
 		WithWriteStrategy(&StorageWrite{}),
 	)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
 	ctx := context.Background()
-	if err := s.Sink(ctx, sampleIntegrationRow("storage")); err != nil {
+	if _, err := s.Sink(ctx, sampleIntegrationRow("storage")); err != nil {
 		t.Fatalf("Sink() error = %v", err)
 	}
 	if err := s.Close(ctx); err != nil {
@@ -322,7 +322,7 @@ func TestIntegrationLoadJobWithANarrowerSchema(t *testing.T) {
 
 	ctx := context.Background()
 	wide, err := New[integrationRow](client, relation,
-		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -336,7 +336,7 @@ func TestIntegrationLoadJobWithANarrowerSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() for the narrow row error = %v", err)
 	}
-	if err := narrow.Sink(ctx, narrowRow{ID: "narrow", Count: 1}); err != nil {
+	if _, err := narrow.Sink(ctx, narrowRow{ID: "narrow", Count: 1}); err != nil {
 		t.Fatalf("Sink() error = %v", err)
 	}
 	if err := narrow.Close(ctx); err != nil {
@@ -373,7 +373,7 @@ func TestIntegrationAppendNewColumns(t *testing.T) {
 
 	ctx := context.Background()
 	before, err := New[narrowRow](client, relation,
-		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -384,7 +384,7 @@ func TestIntegrationAppendNewColumns(t *testing.T) {
 	}
 
 	after, err := New[grownRow](client, relation,
-		WithMigrationStrategy(AppendNewColumns{}),
+		WithMigrationStrategy(AppendNewColumns{}, nil),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -411,7 +411,7 @@ func TestIntegrationAppendNewColumns(t *testing.T) {
 		t.Errorf("the table has no extra column: %s", formatSchema(md.Schema))
 	}
 
-	if err := after.Sink(ctx, grownRow{ID: "grown", Count: 2, Extra: "e"}); err != nil {
+	if _, err := after.Sink(ctx, grownRow{ID: "grown", Count: 2, Extra: "e"}); err != nil {
 		t.Fatalf("Sink() error = %v", err)
 	}
 	if err := after.Close(ctx); err != nil {
@@ -436,7 +436,7 @@ func TestIntegrationSyncAllColumnsDropsAColumn(t *testing.T) {
 
 	ctx := context.Background()
 	wide, err := New[grownRow](client, relation,
-		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -447,7 +447,7 @@ func TestIntegrationSyncAllColumnsDropsAColumn(t *testing.T) {
 	}
 
 	narrow, err := New[narrowRow](client, relation,
-		WithMigrationStrategy(SyncAllColumns{}),
+		WithMigrationStrategy(SyncAllColumns{}, nil),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -478,7 +478,7 @@ func TestIntegrationIgnoreColumnsKeepsAColumn(t *testing.T) {
 
 	ctx := context.Background()
 	wide, err := New[grownRow](client, relation,
-		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -489,7 +489,7 @@ func TestIntegrationIgnoreColumnsKeepsAColumn(t *testing.T) {
 	}
 
 	narrow, err := New[narrowRow](client, relation,
-		WithMigrationStrategy(SyncAllColumns{IgnoreColumns: []string{"extra"}}),
+		WithMigrationStrategy(SyncAllColumns{IgnoreColumns: []string{"extra"}}, nil),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -527,7 +527,7 @@ func TestIntegrationMissingTableIsReported(t *testing.T) {
 	// The default strategy creates a missing table, so this needs MigrationNone to
 	// reach ErrTableMissing at all.
 	s, err := New[narrowRow](client, relation,
-		WithMigrationStrategy(MigrationNone{}),
+		WithMigrationStrategy(MigrationNone{}, nil),
 		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
@@ -578,13 +578,13 @@ func TestIntegrationLoadJobsThroughCloudStorage(t *testing.T) {
 		Prefix: "bqsink-integration",
 	}
 	s, err := New[integrationRow](client, relation,
-		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
 		WithWriteStrategy(&LoadJobs{Staging: staging}),
 	)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	if err := s.Sink(ctx, sampleIntegrationRow("staged")); err != nil {
+	if _, err := s.Sink(ctx, sampleIntegrationRow("staged")); err != nil {
 		t.Fatalf("Sink() error = %v", err)
 	}
 	if err := s.Close(ctx); err != nil {
@@ -621,13 +621,13 @@ func TestIntegrationStagedObjectIsRemoved(t *testing.T) {
 	prefix := fmt.Sprintf("bqsink-cleanup-%d", time.Now().UnixNano())
 	staging := &bqgcs.Staging{Client: gcs, Bucket: bucket, Prefix: prefix}
 	s, err := New[narrowRow](client, relation,
-		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
 		WithWriteStrategy(&LoadJobs{Staging: staging}),
 	)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	if err := s.Sink(ctx, narrowRow{ID: "staged", Count: 1}); err != nil {
+	if _, err := s.Sink(ctx, narrowRow{ID: "staged", Count: 1}); err != nil {
 		t.Fatalf("Sink() error = %v", err)
 	}
 	if err := s.Close(ctx); err != nil {
@@ -696,13 +696,13 @@ func TestIntegrationStagedObjectIsKept(t *testing.T) {
 
 	staging := &bqgcs.Staging{Client: gcs, Bucket: bucket, Prefix: prefix, Keep: true}
 	s, err := New[narrowRow](client, relation,
-		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
 		WithWriteStrategy(&LoadJobs{Staging: staging}),
 	)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	if err := s.Sink(ctx, narrowRow{ID: "kept", Count: 1}); err != nil {
+	if _, err := s.Sink(ctx, narrowRow{ID: "kept", Count: 1}); err != nil {
 		t.Fatalf("Sink() error = %v", err)
 	}
 	if err := s.Close(ctx); err != nil {
@@ -744,7 +744,7 @@ func TestIntegrationIngestionMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	if err := s.Sink(ctx, metadataIntegrationRow{ID: "with-metadata"}); err != nil {
+	if _, err := s.Sink(ctx, metadataIntegrationRow{ID: "with-metadata"}); err != nil {
 		t.Fatalf("Sink() error = %v; BigQuery may have rejected the underscore-prefixed columns", err)
 	}
 	if err := s.Close(ctx); err != nil {
@@ -846,7 +846,7 @@ func TestIntegrationTimeColumnOptions(t *testing.T) {
 			}
 			ctx := context.Background()
 			row := timeColumnIntegrationRow{ID: tt.name, At: at, OnDay: at, LocalAt: at, OpenAt: at}
-			if err := s.Sink(ctx, row); err != nil {
+			if _, err := s.Sink(ctx, row); err != nil {
 				t.Fatalf("Sink() error = %v", err)
 			}
 			if err := s.Close(ctx); err != nil {

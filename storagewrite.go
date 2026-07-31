@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"sync"
+	"strings"
 
 	"cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
@@ -102,7 +102,7 @@ func (w *StorageWrite) Open(ctx context.Context, table *bigquery.Table, schema b
 // schema descriptor, so that the relation and the declared schema win over
 // anything naming them.
 func (w *StorageWrite) writerOptions(table *bigquery.Table, descriptor *descriptorpb.DescriptorProto) []managedwriter.WriterOption {
-	opts := make([]managedwriter.WriterOption, 0, len(w.WriterOptions)+3)
+	opts := make([]managedwriter.WriterOption, 0, len(w.WriterOptions)+4)
 	opts = append(opts, w.WriterOptions...)
 	if w.StreamName != "" {
 		opts = append(opts, managedwriter.WithStreamName(w.StreamName))
@@ -117,35 +117,76 @@ func (w *StorageWrite) writerOptions(table *bigquery.Table, descriptor *descript
 				table.ProjectID, table.DatasetID, table.TableID)),
 		)
 	}
-	return append(opts, managedwriter.WithSchemaDescriptor(descriptor))
+	opts = append(opts, managedwriter.WithSchemaDescriptor(descriptor))
+	if w.DisableWriteRetries {
+		return opts
+	}
+	// Retrying is the writer's responsibility, and the client library's own retries
+	// are the ones that know how to re-enqueue an append on a reconnected stream.
+	// They suit at-least-once delivery, which is what bqsink offers.
+	return append(opts, managedwriter.EnableWriteRetries(true))
 }
 
+// storageWriteWriter holds nothing that changes, so concurrent writes need no
+// lock: ManagedStream is safe for concurrent use itself.
 type storageWriteWriter struct {
 	client     *managedwriter.Client
 	stream     *managedwriter.ManagedStream
 	schema     bigquery.Schema
 	descriptor protoreflect.MessageDescriptor
 	logger     *slog.Logger
-
-	mu      sync.Mutex
-	pending []*managedwriter.AppendResult
 }
 
-// Append implements RowWriter. It sends the row and keeps the result to be checked
-// by Flush, so that appends are not serialised on a round trip each.
-func (w *storageWriteWriter) Append(ctx context.Context, row map[string]bigquery.Value) error {
-	data, err := w.marshalRow(row)
-	if err != nil {
-		return err
+// WriteRows implements RowWriter. It sends rows as one append and waits for
+// BigQuery to accept them.
+//
+// An append is all or nothing, so this returns len(rows) or 0: BigQuery appends
+// none of the rows in a request it rejects.
+func (w *storageWriteWriter) WriteRows(ctx context.Context, rows []Row) (int, error) {
+	if len(rows) == 0 {
+		return 0, nil
 	}
-	result, err := w.stream.AppendRows(ctx, [][]byte{data})
-	if err != nil {
-		return fmt.Errorf("bqsink: append a row to %s: %w", w.stream.StreamName(), err)
+	data := make([][]byte, len(rows))
+	for i := range rows {
+		marshalled, err := w.marshalRow(rows[i].Values)
+		if err != nil {
+			return 0, err
+		}
+		data[i] = marshalled
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.pending = append(w.pending, result)
-	return nil
+	result, err := w.stream.AppendRows(ctx, data)
+	if err != nil {
+		return 0, fmt.Errorf("bqsink: append %d row(s) to %s: %w", len(rows), w.stream.StreamName(), err)
+	}
+	// The full response is what carries the per-row detail; GetResult would leave
+	// only the request-level error to report.
+	response, err := result.FullResponse(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("bqsink: %d row(s) were rejected by %s: %w%s",
+			len(rows), w.stream.StreamName(), err, describeRowErrors(response, rows))
+	}
+	w.logger.DebugContext(ctx, "appended rows", slog.Int("rows", len(rows)))
+	return len(rows), nil
+}
+
+// describeRowErrors names the rows BigQuery found malformed, which it reports by
+// their index in the request. It returns the empty string when there are none, so
+// that a request-level failure is not dressed up as a row-level one.
+func describeRowErrors(response *storagepb.AppendRowsResponse, rows []Row) string {
+	rowErrors := response.GetRowErrors()
+	if len(rowErrors) == 0 {
+		return ""
+	}
+	described := make([]string, 0, len(rowErrors))
+	for _, rowErr := range rowErrors {
+		index := rowErr.GetIndex()
+		id := "unknown row"
+		if index >= 0 && index < int64(len(rows)) {
+			id = rows[index].ID
+		}
+		described = append(described, fmt.Sprintf("%s: %s: %s", id, rowErr.GetCode(), rowErr.GetMessage()))
+	}
+	return fmt.Sprintf(" (malformed rows: %s)", strings.Join(described, "; "))
 }
 
 func (w *storageWriteWriter) marshalRow(row map[string]bigquery.Value) ([]byte, error) {
@@ -164,52 +205,17 @@ func (w *storageWriteWriter) marshalRow(row map[string]bigquery.Value) ([]byte, 
 	return data, nil
 }
 
-// Flush implements RowWriter. It waits for every append handed over so far and
-// reports the first one BigQuery rejected.
+// Close implements RowWriter. It closes both the stream and the client, so that
+// neither leaks its gRPC connection.
 //
-// Only the first rejection is returned, so the rest are logged: they describe rows
-// that never landed either, and nothing else would say so.
-func (w *storageWriteWriter) Flush(ctx context.Context) error {
-	w.mu.Lock()
-	pending := w.pending
-	w.pending = nil
-	w.mu.Unlock()
-
-	w.logger.DebugContext(ctx, "waiting for the appends handed over so far",
-		slog.Int("appends", len(pending)))
-	var firstErr error
-	for _, result := range pending {
-		_, err := result.GetResult(ctx)
-		switch {
-		case err == nil:
-		case firstErr == nil:
-			firstErr = fmt.Errorf("bqsink: an append to %s was rejected: %w", w.stream.StreamName(), err)
-		default:
-			w.logger.WarnContext(ctx, "a further append was rejected as well",
-				slog.String("stream", w.stream.StreamName()),
-				slog.Any("error", err))
-		}
-	}
-	return firstErr
-}
-
-// Close implements RowWriter. It waits for the outstanding appends and then closes
-// both the stream and the client, so that neither leaks its gRPC connection.
-//
-// Its error reports rows that never reached BigQuery and must not be discarded.
-// A failure to close is only returned when there is nothing worse to report, since
-// rows that never landed matter more than a connection that did not shut down
-// cleanly; where it gives way it is logged instead.
+// Only the first failure is returned, so the other is logged: nothing else would
+// say that a connection did not shut down cleanly.
 func (w *storageWriteWriter) Close(ctx context.Context) error {
-	err := w.Flush(ctx)
+	var err error
 	// managedwriter reports a cleanly closed stream as io.EOF: "For normal
 	// operation, mark the stream error as io.EOF."
 	if serr := w.stream.Close(); serr != nil && !errors.Is(serr, io.EOF) {
-		if err == nil {
-			err = fmt.Errorf("bqsink: close the write stream: %w", serr)
-		} else {
-			w.logger.WarnContext(ctx, "could not close the write stream", slog.Any("error", serr))
-		}
+		err = fmt.Errorf("bqsink: close the write stream: %w", serr)
 	}
 	if cerr := w.client.Close(); cerr != nil {
 		if err == nil {

@@ -54,6 +54,10 @@ return s.dropColumns(ctx, change.DropColumns)
 
 `table.Update(ctx, tm, etag)` に `md.ETag` を渡している。**複数レプリカが同時に同じ列を追加しようとする競合は、BigQuery が 412 を返すのでリトライで解決する。** 自前でロックを作る必要はない。
 
+**リトライは `WithMigrationStrategy(strategy, retryPolicy)` の第2引数で決まる。** 2引数にしたのは、`nil` を渡す＝リトライしないことを呼び出し側に必ず表明させるため。1引数のままだと「412 の自己修復が黙って無効になっている」状態を作れてしまう。`WithMigrationStrategy` を呼ばなければ `New` が `AppendNewColumns{CreateIfMissing: true}` + `DefaultRetryPolicy` を入れるので、既定は安全側。
+
+`retryPolicy` に `nil` を渡すと `retrying` が op を1回呼ぶだけになる（`gax.WithRetry(nil)` は使わない）。
+
 リトライは毎回 `Metadata` から読み直す（`migrate` 全体をリトライしている）。etag だけ再取得しても意味がないため。
 
 ## `isRetryable` は両プロトコルを見る
@@ -65,7 +69,9 @@ HTTP: 412, 409, 429, 500, 502, 503, 504
 gRPC: Unavailable, DeadlineExceeded, ResourceExhausted, Internal, Aborted
 ```
 
-`DefaultRetryPolicy` は `Migrate` と書き込みの両方で使われる。以前 `isConcurrentChange`（412/409 のみ）を使っていて、書き込みに転用したときリトライが効かなかった。**テストヘルパー `fastRetryPolicy` も同じ判定関数を使うこと**（バックオフだけ速い）。
+`DefaultRetryPolicy` は `Migrate` の既定と `LoadJobs.RetryPolicy` の既定の両方で使われる。以前 `isConcurrentChange`（412/409 のみ）を使っていて、書き込みに転用したときリトライが効かなかった。**テストヘルパー `fastRetryPolicy` も同じ判定関数を使うこと**（バックオフだけ速い）。
+
+`retrying` は `Sinker` のメソッドではなくパッケージレベル関数（`retrying(ctx, logger, what, newRetryer, op)`）。`Migrate` と `loadJobsWriter.WriteRows` の両方から呼ぶため。**書き込みのリトライを `Sinker` 側に戻さないこと** — 理由は `.claude/rules/transports.md`。
 
 `attemptLimiter` は gax が意図的に提供しない回数制限を足すためのもの。godoc に "MaxNumRetries / RPCDeadline is specifically not provided" とある。
 

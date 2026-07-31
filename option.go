@@ -28,11 +28,11 @@ func validateStrategy(name string, s any) error {
 }
 
 type config struct {
-	marshalers    *Marshalers
-	strategy      MigrationStrategy
-	writeStrategy WriteStrategy
-	retryPolicy   func() gax.Retryer
-	logger        *slog.Logger
+	marshalers     *Marshalers
+	strategy       MigrationStrategy
+	migrationRetry func() gax.Retryer
+	writeStrategy  WriteStrategy
+	logger         *slog.Logger
 }
 
 // Option configures a Sinker at construction time.
@@ -74,16 +74,30 @@ func WithMarshalers(marshalers ...*Marshalers) Option {
 	}
 }
 
-// WithMigrationStrategy selects the migration strategy. The default is
-// AppendNewColumns{CreateIfMissing: true}: keeping the table in step with the
-// declaration is what bqsink is for, and adding a column is not destructive.
+// WithMigrationStrategy selects the migration strategy and how Migrate retries.
+//
+// Without it the strategy is AppendNewColumns{CreateIfMissing: true} and the
+// retries are DefaultRetryPolicy's: keeping the table in step with the declaration
+// is what bqsink is for, adding a column is not destructive, and two replicas
+// deploying at once add the same column at once, which BigQuery reports as a failed
+// precondition that only a retry gets past.
 //
 // Pass MigrationNone{} to leave an existing table alone, or SyncAllColumns{} to
 // also drop columns the declaration no longer has.
 //
+// retryPolicy says what to do about a failure a later attempt could get past, such
+// as that failed precondition. A nil retryPolicy means Migrate attempts the change
+// once; pass DefaultRetryPolicy to keep the retries bqsink would otherwise use.
+// It is called once per Migrate, because a gax.Retryer carries the state of its
+// backoff and cannot be reused, and returning a bare gax.OnErrorFunc places no
+// limit on the number of attempts.
+//
+// Writing is not retried from here: that is the write strategy's own business,
+// since it is the one holding the rows while they are in flight.
+//
 // If s implements Validator, its Validate method decides whether the settings are
 // usable and New fails when they are not.
-func WithMigrationStrategy(s MigrationStrategy) Option {
+func WithMigrationStrategy(s MigrationStrategy, retryPolicy func() gax.Retryer) Option {
 	return func(c *config) error {
 		if s == nil {
 			return errors.New("bqsink: WithMigrationStrategy: strategy is nil")
@@ -92,24 +106,7 @@ func WithMigrationStrategy(s MigrationStrategy) Option {
 			return err
 		}
 		c.strategy = s
-		return nil
-	}
-}
-
-// WithWriteStrategy selects how rows reach BigQuery. The default is
-// &StorageWrite{}, which uses the Storage Write API's default stream.
-//
-// If s implements Validator, its Validate method decides whether the settings are
-// usable and New fails when they are not.
-func WithWriteStrategy(s WriteStrategy) Option {
-	return func(c *config) error {
-		if s == nil {
-			return errors.New("bqsink: WithWriteStrategy: strategy is nil")
-		}
-		if err := validateStrategy("WithWriteStrategy", s); err != nil {
-			return err
-		}
-		c.writeStrategy = s
+		c.migrationRetry = retryPolicy
 		return nil
 	}
 }
@@ -123,7 +120,7 @@ func WithWriteStrategy(s WriteStrategy) Option {
 // Three levels are used and Error is not among them, since a failure is returned
 // rather than logged.
 //
-//	Debug  what a transport did: the stream it opened, the rows it flushed, the
+//	Debug  what a transport did: the stream it opened, the rows it wrote, the
 //	       difference Migrate found
 //	Info   a change bqsink made to the table, and a load job it ran
 //	Warn   something bqsink had to let pass: a failure it could not return, or a
@@ -138,18 +135,24 @@ func WithLogger(logger *slog.Logger) Option {
 	}
 }
 
-// WithRetryPolicy replaces how Migrate retries, in place of DefaultRetryPolicy.
+// WithWriteStrategy selects how rows reach BigQuery. The default is
+// &StorageWrite{}, which uses the Storage Write API's default stream.
 //
-// newRetryer is called once per Migrate, because a gax.Retryer carries the state
-// of its backoff and cannot be reused. Returning a bare gax.OnErrorFunc places
-// no limit on the number of attempts, so Migrate would then keep retrying until
-// its context is done; wrap it if a limit is wanted.
-func WithRetryPolicy(newRetryer func() gax.Retryer) Option {
+// Retrying is the strategy's own business, so how a transient failure is handled
+// is settled on the strategy rather than here: LoadJobs takes a RetryPolicy and
+// StorageWrite leaves it to the client library.
+//
+// If s implements Validator, its Validate method decides whether the settings are
+// usable and New fails when they are not.
+func WithWriteStrategy(s WriteStrategy) Option {
 	return func(c *config) error {
-		if newRetryer == nil {
-			return errors.New("bqsink: WithRetryPolicy: newRetryer is nil")
+		if s == nil {
+			return errors.New("bqsink: WithWriteStrategy: strategy is nil")
 		}
-		c.retryPolicy = newRetryer
+		if err := validateStrategy("WithWriteStrategy", s); err != nil {
+			return err
+		}
+		c.writeStrategy = s
 		return nil
 	}
 }

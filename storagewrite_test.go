@@ -204,21 +204,26 @@ func TestStorageWriteWriterOptionsPutBqsinkLast(t *testing.T) {
 		want     int
 	}{
 		{
-			name:     "a new stream carries the type, destination and descriptor",
+			name:     "a new stream carries the type, destination, descriptor and write retries",
 			strategy: &StorageWrite{},
+			want:     4,
+		},
+		{
+			name:     "an existing stream carries its name, the descriptor and write retries",
+			strategy: &StorageWrite{StreamName: "projects/p/datasets/d/tables/t/streams/s"},
 			want:     3,
 		},
 		{
-			name:     "an existing stream carries its name and the descriptor",
-			strategy: &StorageWrite{StreamName: "projects/p/datasets/d/tables/t/streams/s"},
-			want:     2,
+			name:     "DisableWriteRetries leaves the retry option off",
+			strategy: &StorageWrite{DisableWriteRetries: true},
+			want:     3,
 		},
 		{
 			name: "the caller's options are kept alongside",
 			strategy: &StorageWrite{WriterOptions: []managedwriter.WriterOption{
 				managedwriter.WithTraceID("test"),
 			}},
-			want: 4,
+			want: 5,
 		},
 	}
 

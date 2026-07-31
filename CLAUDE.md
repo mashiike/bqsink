@@ -37,6 +37,10 @@ BigQuery への書き込みコードを各所で書いていて、一番しん�
 | ログは `slog`、`WithLogger` 未指定なら `slog.DiscardHandler` で破棄 | ライブラリが利用者の `slog.Default()` に断りなく書き始めないため。`io.Discard` + TextHandler と違い `Enabled` が false なので整形コストも出ない |
 | ログの `Error` レベルは使わない | エラーは戻り値で返している。ログにも出すと二重処理。`Warn` は「返らずに捨てている事象」専用で、ここが `_ = err` の代わり |
 | `SinkerID` / `RowID` は UUID v7 | 辞書順が生成順になるのでクラスタリングキーに使える。v4 にすると失われる |
+| **`RowWriter` は `io.Writer` の契約を写す**（`WriteRows(ctx, rows) (n int, err error)`、`n < len(rows)` なら必ず non-nil error） | 「届いた数」を返す形にすると、届いていないのに成功を返す経路が作れない。失敗した行は `rows[n:]` で呼び出し側が持っているので、識別子を持ち回る損失報告 API（`UndeliveredError` 等）が不要になる |
+| **`Sinker` はバッファリングしない。`Sink(ctx, vs...)` に渡された行がバッチ** | `io.Writer` にバッファが無く `bufio` が別パッケージなのと同じ配置。溜める層が「失敗した行を捨てるか保持するか」を持つと欠損の温床になる。追跡ポリシーは呼び出し側のもの |
+| **リトライは行を持っている層が持つ** | 再送できるのは行を握っている層だけ。`Sinker` は `Migrate` だけリトライし、書き込みは `RowWriter` の責務（`LoadJobs.RetryPolicy` / `StorageWrite` は managedwriter の `EnableWriteRetries`）。`Sinker` が `WriteRows` を包むと「writer が諦めた後にもう一度呼ぶ」形になり、欠損バグが再発する |
+| `WithMigrationStrategy(strategy, retryPolicy)` は2引数 | `nil` = リトライなしを呼び出し側に必ず表明させるため。1引数だと 412 の自己修復が黙って無効になる状態を作れる。`MigrationRetryer` のような decorator 型にしなかったのは、`Plan` が純関数でリトライしたいのは `Metadata` / `Update` / DDL だから包めない |
 
 ## 実装の指針
 
@@ -72,4 +76,5 @@ BQSINK_TEST_PROJECT=... BQSINK_TEST_BUCKET=... go test ./...  # + GCS ステー�
 - **ネスト RECORD 内部の変更のマイグレーション適用**。検出して `ErrSchemaConflict` を返すだけ。struct が既定で JSON なので `record` タグを使わない限り遭遇しない
 - **`PendingStream` / `BufferedStream`**。commit / offset flush が必要で、やらないと行が永久に見えない。`Validate` で拒否している
 - **exactly-once**。リトライで行が重複しうる
-- **BigQuery のロードジョブ数 quota とリクエストサイズ上限の具体的な数値**。`DefaultFlushRows` / `DefaultFlushBytes` は未確認の値
+- **バッファリング**。`Sinker` は溜めない。`Sink(ctx, vs...)` に渡された行がそのままバッチで、溜めるのは呼び出し側の仕事。`bufio.NewWriter` 相当で `Sinker` を外から包む `BufferedSinker` を足す余地はある（罠は `.claude/rules/transports.md`）
+- **BigQuery のロードジョブ数 quota とリクエストサイズ上限の具体的な数値**。未確認。バッチサイズを決めるのは呼び出し側になったので、ライブラリ側に推測値の定数を置くのはやめた

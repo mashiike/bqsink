@@ -676,19 +676,18 @@ func TestSinkWritesThroughTheWriteStrategy(t *testing.T) {
 	}}
 	writer := &fakeRowWriter{}
 	s := newTestSinker[nestedRow](t, fake,
-		WithMigrationStrategy(AppendNewColumns{}),
+		WithMigrationStrategy(AppendNewColumns{}, nil),
 		WithWriteStrategy(&fakeWriteStrategy{writer: writer}),
 	)
 
 	ctx := t.Context()
-	if err := s.Sink(ctx, nestedRow{A: "one", B: 1}); err != nil {
+	if _, err := s.Sink(ctx, nestedRow{A: "one", B: 1}); err != nil {
 		t.Fatalf("Sink() error = %v", err)
 	}
-	if err := s.SinkAll(ctx, nestedRow{A: "two", B: 2}, nestedRow{A: "three", B: 3}); err != nil {
-		t.Fatalf("SinkAll() error = %v", err)
-	}
-	if err := s.Flush(ctx); err != nil {
-		t.Fatalf("Flush() error = %v", err)
+	if n, err := s.Sink(ctx, nestedRow{A: "two", B: 2}, nestedRow{A: "three", B: 3}); err != nil {
+		t.Fatalf("Sink() error = %v", err)
+	} else if n != 2 {
+		t.Errorf("Sink() n = %d, want 2", n)
 	}
 	if err := s.Close(ctx); err != nil {
 		t.Fatalf("Close() error = %v", err)
@@ -701,11 +700,6 @@ func TestSinkWritesThroughTheWriteStrategy(t *testing.T) {
 	}
 	if !reflect.DeepEqual(writer.rows, want) {
 		t.Errorf("appended rows = %#v, want %#v", writer.rows, want)
-	}
-	// Twice: the explicit Flush, and the one Close puts under the retry policy so
-	// that the rows it is holding get one more chance.
-	if writer.flushes != 2 {
-		t.Errorf("Flush was called %d times, want 2 (the explicit one and the one Close asks for)", writer.flushes)
 	}
 	if writer.closes != 1 {
 		t.Errorf("Close was called %d times, want 1", writer.closes)

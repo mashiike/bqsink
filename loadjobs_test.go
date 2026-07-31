@@ -14,6 +14,7 @@ import (
 
 	"cloud.google.com/go/bigquery"
 	"cloud.google.com/go/civil"
+	gax "github.com/googleapis/gax-go/v2"
 )
 
 type loadCall struct {
@@ -21,7 +22,8 @@ type loadCall struct {
 	schema bigquery.Schema
 }
 
-// fakeLoader records the load jobs a writer would submit.
+// fakeLoader records the load jobs a writer would submit, failing the calls
+// errs names by index and succeeding the rest.
 type fakeLoader struct {
 	mu    sync.Mutex
 	calls []loadCall
@@ -45,18 +47,6 @@ func (l *fakeLoader) snapshot() []loadCall {
 	return l.calls
 }
 
-// testLoadWriter builds a writer whose size threshold is out of the way, so that
-// a test setting flushRows exercises the row count alone.
-func testLoadWriter(loader jobLoader, flushRows int, schema bigquery.Schema) *loadJobsWriter {
-	return &loadJobsWriter{
-		loader:     loader,
-		schema:     schema,
-		flushRows:  flushRows,
-		flushBytes: DefaultFlushBytes,
-		logger:     discardLogger(),
-	}
-}
-
 func abSchema() bigquery.Schema {
 	return bigquery.Schema{
 		{Name: "A", Type: bigquery.StringFieldType},
@@ -64,28 +54,37 @@ func abSchema() bigquery.Schema {
 	}
 }
 
-func TestLoadJobsBuffersUntilTheThreshold(t *testing.T) {
+func rowOf(id string, values map[string]bigquery.Value) Row {
+	return Row{ID: id, Values: values}
+}
+
+// noRetryPolicy never lets an attempt be retried, unlike fastRetryPolicy which
+// still retries a retryable error.
+func noRetryPolicy() gax.Retryer {
+	return gax.OnErrorFunc(gax.Backoff{}, func(error) bool { return false })
+}
+
+func TestLoadJobsWriteRowsSubmitsOneJob(t *testing.T) {
 	t.Parallel()
 
 	loader := &fakeLoader{}
-	w := testLoadWriter(loader, 3, abSchema())
-	ctx := t.Context()
+	w := &loadJobsWriter{loader: loader, schema: abSchema(), logger: discardLogger()}
 
-	for i := range 2 {
-		if err := w.Append(ctx, map[string]bigquery.Value{"A": "x", "B": int64(i)}); err != nil {
-			t.Fatalf("Append() error = %v", err)
-		}
+	rows := []Row{
+		rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(0)}),
+		rowOf("r2", map[string]bigquery.Value{"A": "x", "B": int64(1)}),
+		rowOf("r3", map[string]bigquery.Value{"A": "x", "B": int64(2)}),
 	}
-	if calls := loader.snapshot(); len(calls) != 0 {
-		t.Fatalf("a load job was submitted after 2 of 3 rows: %d call(s)", len(calls))
+	n, err := w.WriteRows(t.Context(), rows)
+	if err != nil {
+		t.Fatalf("WriteRows() error = %v", err)
 	}
-
-	if err := w.Append(ctx, map[string]bigquery.Value{"A": "x", "B": int64(2)}); err != nil {
-		t.Fatalf("Append() error = %v", err)
+	if n != len(rows) {
+		t.Errorf("WriteRows() n = %d, want %d", n, len(rows))
 	}
 	calls := loader.snapshot()
 	if len(calls) != 1 {
-		t.Fatalf("load was called %d times, want 1 once the threshold was reached", len(calls))
+		t.Fatalf("load was called %d times, want 1", len(calls))
 	}
 	lines := strings.Split(strings.TrimSuffix(calls[0].rows, "\n"), "\n")
 	if len(lines) != 3 {
@@ -96,108 +95,141 @@ func TestLoadJobsBuffersUntilTheThreshold(t *testing.T) {
 	}
 }
 
-func TestLoadJobsFlushSubmitsWhatIsHeld(t *testing.T) {
+func TestLoadJobsWriteRowsWithNoRowsDoesNothing(t *testing.T) {
 	t.Parallel()
 
 	loader := &fakeLoader{}
-	w := testLoadWriter(loader, 1000, abSchema())
-	ctx := t.Context()
+	w := &loadJobsWriter{loader: loader, schema: abSchema(), logger: discardLogger()}
 
-	if err := w.Append(ctx, map[string]bigquery.Value{"A": "only", "B": int64(1)}); err != nil {
-		t.Fatalf("Append() error = %v", err)
+	n, err := w.WriteRows(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("WriteRows() error = %v", err)
 	}
-	if err := w.Flush(ctx); err != nil {
-		t.Fatalf("Flush() error = %v", err)
-	}
-	calls := loader.snapshot()
-	if len(calls) != 1 {
-		t.Fatalf("load was called %d times, want 1", len(calls))
-	}
-	if want := `{"A":"only","B":1}` + "\n"; calls[0].rows != want {
-		t.Errorf("rows = %q, want %q", calls[0].rows, want)
-	}
-}
-
-func TestLoadJobsFlushWithNothingHeldDoesNothing(t *testing.T) {
-	t.Parallel()
-
-	loader := &fakeLoader{}
-	w := testLoadWriter(loader, 10, abSchema())
-	ctx := t.Context()
-
-	if err := w.Flush(ctx); err != nil {
-		t.Fatalf("Flush() error = %v", err)
-	}
-	if err := w.Close(ctx); err != nil {
-		t.Fatalf("Close() error = %v", err)
+	if n != 0 {
+		t.Errorf("WriteRows() n = %d, want 0", n)
 	}
 	if calls := loader.snapshot(); len(calls) != 0 {
-		t.Errorf("load was called %d times with nothing buffered, want 0", len(calls))
+		t.Errorf("load was called %d times with nothing to write, want 0", len(calls))
 	}
 }
 
-func TestLoadJobsCloseFlushes(t *testing.T) {
+// TestLoadJobsWriteRowsRetriesAndResendsEveryRow is the regression test for the
+// bug where a retried load submitted after the buffer had been cleared, so the
+// second attempt sent nothing and returned nil while the rows were never
+// written. It checks not just that load was called twice, but that the
+// successful call still carried every row, byte for byte the same as the first.
+func TestLoadJobsWriteRowsRetriesAndResendsEveryRow(t *testing.T) {
 	t.Parallel()
 
-	loader := &fakeLoader{}
-	w := testLoadWriter(loader, 1000, abSchema())
-	ctx := t.Context()
+	loader := &fakeLoader{errs: []error{unavailableErr(), nil}}
+	w := &loadJobsWriter{loader: loader, schema: abSchema(), retryPolicy: fastRetryPolicy, logger: discardLogger()}
 
-	if err := w.Append(ctx, map[string]bigquery.Value{"A": "x", "B": int64(1)}); err != nil {
-		t.Fatalf("Append() error = %v", err)
+	rows := []Row{
+		rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(0)}),
+		rowOf("r2", map[string]bigquery.Value{"A": "y", "B": int64(1)}),
+		rowOf("r3", map[string]bigquery.Value{"A": "z", "B": int64(2)}),
 	}
-	if err := w.Close(ctx); err != nil {
-		t.Fatalf("Close() error = %v", err)
+	n, err := w.WriteRows(t.Context(), rows)
+	if err != nil {
+		t.Fatalf("WriteRows() error = %v, want the retry to get through", err)
 	}
-	if calls := loader.snapshot(); len(calls) != 1 {
-		t.Errorf("load was called %d times, want 1 from Close", len(calls))
-	}
-}
-
-// TestLoadJobsDropsRowsOnFailure guards against the buffer growing without bound
-// when a table keeps rejecting loads.
-func TestLoadJobsDropsRowsOnFailure(t *testing.T) {
-	t.Parallel()
-
-	sentinel := errors.New("load refused")
-	loader := &fakeLoader{errs: []error{sentinel, nil}}
-	w := testLoadWriter(loader, 1, abSchema())
-	ctx := t.Context()
-
-	err := w.Append(ctx, map[string]bigquery.Value{"A": "lost", "B": int64(1)})
-	if !errors.Is(err, sentinel) {
-		t.Fatalf("Append() error = %v, want the load failure", err)
-	}
-	if !strings.Contains(err.Error(), "dropped") {
-		t.Errorf("Append() error = %v, want it to say the rows were dropped", err)
-	}
-
-	if err := w.Append(ctx, map[string]bigquery.Value{"A": "kept", "B": int64(2)}); err != nil {
-		t.Fatalf("the second Append() error = %v", err)
+	if n != len(rows) {
+		t.Errorf("WriteRows() n = %d, want %d", n, len(rows))
 	}
 	calls := loader.snapshot()
 	if len(calls) != 2 {
-		t.Fatalf("load was called %d times, want 2", len(calls))
+		t.Fatalf("load was called %d times, want 2 (one failure then a success)", len(calls))
 	}
-	if strings.Contains(calls[1].rows, "lost") {
-		t.Errorf("the second load carried the dropped row: %q", calls[1].rows)
+	lines := strings.Split(strings.TrimSuffix(calls[1].rows, "\n"), "\n")
+	if len(lines) != 3 {
+		t.Errorf("the successful load carried %d lines, want all 3 rows", len(lines))
 	}
-	if !strings.Contains(calls[1].rows, "kept") {
-		t.Errorf("the second load did not carry the new row: %q", calls[1].rows)
+	if calls[1].rows != calls[0].rows {
+		t.Errorf("the retried load carried a different payload:\nfirst:  %q\nsecond: %q", calls[0].rows, calls[1].rows)
 	}
 }
 
-func TestLoadJobsRejectsARowTheSchemaDoesNotCover(t *testing.T) {
+func TestLoadJobsWriteRowsGivesUpAfterExhaustingRetries(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("load refused")
+	loader := &fakeLoader{errs: []error{sentinel}}
+	w := &loadJobsWriter{loader: loader, retryPolicy: noRetryPolicy, schema: abSchema(), logger: discardLogger()}
+
+	n, err := w.WriteRows(t.Context(), []Row{rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(1)})})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("WriteRows() error = %v, want the load failure", err)
+	}
+	if n != 0 {
+		t.Errorf("WriteRows() n = %d, want 0", n)
+	}
+	if calls := loader.snapshot(); len(calls) != 1 {
+		t.Errorf("load was called %d times, want 1; a policy that retries nothing must not retry", len(calls))
+	}
+}
+
+func TestLoadJobsWriteRowsRetryPolicyControlsWhetherItRetries(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		retryPolicy func() gax.Retryer
+		wantCalls   int
+	}{
+		{name: "nil means one attempt", retryPolicy: nil, wantCalls: 1},
+		{name: "a policy that retries nothing means one attempt", retryPolicy: noRetryPolicy, wantCalls: 1},
+		{name: "a retryable failure is retried", retryPolicy: fastRetryPolicy, wantCalls: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			loader := &fakeLoader{errs: []error{unavailableErr(), nil}}
+			w := &loadJobsWriter{loader: loader, retryPolicy: tt.retryPolicy, schema: abSchema(), logger: discardLogger()}
+
+			_, _ = w.WriteRows(t.Context(), []Row{rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(1)})})
+			if calls := loader.snapshot(); len(calls) != tt.wantCalls {
+				t.Errorf("load was called %d times, want %d", len(calls), tt.wantCalls)
+			}
+		})
+	}
+}
+
+func TestLoadJobsWriteRowsRejectsARowTheSchemaDoesNotCover(t *testing.T) {
 	t.Parallel()
 
 	loader := &fakeLoader{}
-	w := testLoadWriter(loader, 1, abSchema())
-	err := w.Append(t.Context(), map[string]bigquery.Value{"A": "x", "B": int64(1), "C": "extra"})
+	w := &loadJobsWriter{loader: loader, schema: abSchema(), logger: discardLogger()}
+
+	n, err := w.WriteRows(t.Context(), []Row{
+		rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(1), "C": "extra"}),
+	})
 	if err == nil {
-		t.Fatal("Append() error = nil, want a rejection of the unknown column")
+		t.Fatal("WriteRows() error = nil, want a rejection of the unknown column")
+	}
+	if n != 0 {
+		t.Errorf("WriteRows() n = %d, want 0", n)
 	}
 	if calls := loader.snapshot(); len(calls) != 0 {
 		t.Errorf("load was called %d times, want 0", len(calls))
+	}
+}
+
+func TestLoadJobsRetryPolicyDefault(t *testing.T) {
+	t.Parallel()
+
+	if (&LoadJobs{}).retryPolicy() == nil {
+		t.Error("retryPolicy() = nil, want DefaultRetryPolicy when RetryPolicy is unset")
+	}
+	built := 0
+	replacement := func() gax.Retryer {
+		built++
+		return noRetryPolicy()
+	}
+	if got := (&LoadJobs{RetryPolicy: replacement}).retryPolicy(); got == nil {
+		t.Fatal("retryPolicy() = nil, want the replacement")
+	} else if got() == nil {
+		t.Error("the replacement policy was not reached")
 	}
 }
 
@@ -391,67 +423,12 @@ func (s *fakeStager) Stage(ctx context.Context, rows []byte) (string, func(conte
 
 func (s *fakeStager) Validate() error { return s.validate }
 
-func TestLoadJobsFlushesOnSize(t *testing.T) {
-	t.Parallel()
-
-	loader := &fakeLoader{}
-	// One rendered row of abSchema is around 20 bytes, so a small threshold makes
-	// the size trigger rather than the row count.
-	w := &loadJobsWriter{
-		loader:     loader,
-		schema:     abSchema(),
-		flushRows:  1000,
-		flushBytes: 30,
-		logger:     discardLogger(),
-	}
-	ctx := t.Context()
-
-	if err := w.Append(ctx, map[string]bigquery.Value{"A": "first", "B": int64(1)}); err != nil {
-		t.Fatalf("Append() error = %v", err)
-	}
-	if calls := loader.snapshot(); len(calls) != 0 {
-		t.Fatalf("a load job was submitted before the size threshold: %d call(s)", len(calls))
-	}
-	if err := w.Append(ctx, map[string]bigquery.Value{"A": "second", "B": int64(2)}); err != nil {
-		t.Fatalf("Append() error = %v", err)
-	}
-	calls := loader.snapshot()
-	if len(calls) != 1 {
-		t.Fatalf("load was called %d times, want 1 once the buffer passed %d bytes", len(calls), 30)
-	}
-	if !strings.Contains(calls[0].rows, "first") || !strings.Contains(calls[0].rows, "second") {
-		t.Errorf("the load job carried %q, want both rows", calls[0].rows)
-	}
-}
-
-func TestLoadJobsFlushBytesDefault(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		set  int
-		want int
-	}{
-		{name: "unset means the default", set: 0, want: DefaultFlushBytes},
-		{name: "a positive value is kept", set: 4096, want: 4096},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if got := (&LoadJobs{FlushBytes: tt.set}).flushBytes(); got != tt.want {
-				t.Errorf("flushBytes() = %d, want %d", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestLoadJobsStagesThroughAStager(t *testing.T) {
 	t.Parallel()
 
 	stager := &fakeStager{}
 	table := &bigquery.Table{ProjectID: "p", DatasetID: "d", TableID: "t"}
-	w, err := (&LoadJobs{FlushRows: 1, Staging: stager}).Open(t.Context(), table, abSchema(), discardLogger())
+	w, err := (&LoadJobs{Staging: stager}).Open(t.Context(), table, abSchema(), discardLogger())
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}

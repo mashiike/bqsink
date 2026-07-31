@@ -36,33 +36,42 @@ defer func() {
 	}
 }()
 
-if err := s.Sink(ctx, AccessLog{Timestamp: time.Now(), UserID: "u1", Path: "/"}); err != nil {
+rows := []AccessLog{
+	{Timestamp: time.Now(), UserID: "u1", Path: "/"},
+	{Timestamp: time.Now(), UserID: "u2", Path: "/about"},
+}
+n, err := s.Sink(ctx, rows...)
+if err != nil {
+	// rows[n:] never reached BigQuery. They are still yours to deal with.
 	return err
 }
-return s.Flush(ctx)
+return nil
 ```
 
-`Close` and `Flush` report rows that never reached BigQuery, so a bare
-`defer s.Close(ctx)` loses them silently. Capture the error as above.
+`Sink` writes the rows it is given before it returns and buffers nothing between
+calls, so **the rows it is given are the batch.** It returns how many landed, and a
+non-nil error whenever that is fewer than it was given: `rows[n:]` are exactly the
+ones that did not make it, and nothing else records them. Give it a whole batch
+rather than one row at a time, especially with `LoadJobs`, where every call is a
+load job.
 
 ## Options
 
-`New` takes five, and **none of them describes the table.** What the table looks
+`New` takes four, and **none of them describes the table.** What the table looks
 like belongs to the row type; these settle how bqsink behaves around that.
 
 | Option | Default | Section |
 |---|---|---|
-| `WithMigrationStrategy` | `AppendNewColumns{CreateIfMissing: true}` | [Migration](#migration) |
+| `WithMigrationStrategy` | `AppendNewColumns{CreateIfMissing: true}`, four retries | [Migration](#migration) |
 | `WithWriteStrategy` | `&StorageWrite{}` | [Transports](#transports) |
 | `WithMarshalers` | no overrides | [Custom column types](#custom-column-types) |
-| `WithRetryPolicy` | four retries, 200ms to 5s | [Retries](#retries) |
 | `WithLogger` | records are discarded | [Logging](#logging) |
 
 A strategy is configured with a struct literal rather than more options, so that its
 settings never look like one:
 
 ```go
-bqsink.WithWriteStrategy(&bqsink.LoadJobs{FlushRows: 5000})
+bqsink.WithWriteStrategy(&bqsink.LoadJobs{Staging: bqgcs.Staging{Bucket: "staging"}})
 ```
 
 ## Declaring the schema
@@ -380,14 +389,16 @@ bqsink.WithWriteStrategy(&bqsink.StorageWrite{})  // the default
 bqsink.WithWriteStrategy(&bqsink.LoadJobs{})
 ```
 
-**`StorageWrite`** uses the BigQuery Storage Write API. Rows land as they arrive.
-`Append` hands the row over and keeps the pending result, so a rejected row
-surfaces from `Flush` or `Close`. Only the default and committed stream types are
-supported.
+**`StorageWrite`** uses the BigQuery Storage Write API. Each `Sink` sends its rows
+as one append and waits for BigQuery to accept them. An append is all or nothing:
+none of the rows in a rejected request land. Only the default and committed stream
+types are supported.
 
-**`LoadJobs`** buffers rows as newline delimited JSON and submits load jobs. Batch
-oriented: the `Append` that reaches the threshold blocks until BigQuery finishes
-the job. Thresholds are `FlushRows` (10000) and `FlushBytes` (32 MiB).
+**`LoadJobs`** renders the rows as newline delimited JSON and submits one load job
+per `Sink`, blocking until BigQuery finishes it, which takes seconds to minutes.
+A load job is all or nothing too. Nothing is serialised on a lock, so concurrent
+calls submit concurrent jobs — and a table's daily job quota is why rows belong in
+batches rather than one call each.
 
 Large batches can be staged in Cloud Storage instead of being uploaded with the
 job:
@@ -405,19 +416,30 @@ bqsink.WithWriteStrategy(&bqsink.LoadJobs{
 
 ## Retries
 
-A transient failure is retried under one policy, shared by `Migrate` and the write
-path: a concurrent change to the table, a rate limit, or a server side failure,
-over either HTTP or gRPC. Four retries with jittered backoff between 200ms and 5s.
-
-`Close` flushes through the same retry, since the rows it is holding get no later
-chance. The writer is closed whether or not that flush gets through, so a failure
-cannot leak the transport's connections, and the flush's error is the one returned.
+**Retrying belongs to whoever is holding the rows.** A writer still has them while
+they are in flight, so it is the one that can try again; `Sinker` never retries a
+write behind the writer's back.
 
 ```go
-bqsink.WithRetryPolicy(func() gax.Retryer {
-	return gax.OnErrorFunc(gax.Backoff{Initial: time.Second}, myPredicate)
-})
+// Migration: the policy is the second argument, since a strategy is a pure
+// decision and retrying is not part of it. nil means one attempt.
+bqsink.WithMigrationStrategy(bqsink.SyncAllColumns{}, bqsink.DefaultRetryPolicy)
+
+// LoadJobs retries a load job itself.
+bqsink.WithWriteStrategy(&bqsink.LoadJobs{RetryPolicy: myPolicy})
 ```
+
+`DefaultRetryPolicy` is four retries with jittered backoff between 200ms and 5s,
+covering a concurrent change to the table, a rate limit, or a server side failure,
+over either HTTP or gRPC. It is what `New` uses for migration when
+`WithMigrationStrategy` is not given: two replicas deploying at once add the same
+column at once, and BigQuery reports that as a failed precondition that only a retry
+gets past.
+
+`StorageWrite` has no policy to set: the client library's own automatic retries are
+the ones that know how to re-enqueue an append on a reconnected stream, so bqsink
+enables those and the number of attempts is theirs to decide. Set
+`DisableWriteRetries` to have bqsink leave them alone.
 
 **Writes are at-least-once.** A retry can deliver a row twice and neither transport
 deduplicates.

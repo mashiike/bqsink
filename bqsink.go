@@ -92,18 +92,18 @@ func (r clientQueryRunner) run(ctx context.Context, sql string) error {
 //
 // A Sinker is safe for concurrent use.
 type Sinker[T any] struct {
-	client        *bigquery.Client
-	relation      Relation
-	table         *bigquery.Table
-	api           tableAPI
-	query         queryRunner
-	plan          *rowPlan
-	schema        bigquery.Schema
-	metadata      *bigquery.TableMetadata
-	strategy      MigrationStrategy
-	writeStrategy WriteStrategy
-	retryPolicy   func() gax.Retryer
-	logger        *slog.Logger
+	client         *bigquery.Client
+	relation       Relation
+	table          *bigquery.Table
+	api            tableAPI
+	query          queryRunner
+	plan           *rowPlan
+	schema         bigquery.Schema
+	metadata       *bigquery.TableMetadata
+	strategy       MigrationStrategy
+	migrationRetry func() gax.Retryer
+	writeStrategy  WriteStrategy
+	logger         *slog.Logger
 
 	sinkerID  string
 	createdAt time.Time
@@ -134,8 +134,8 @@ type Sinker[T any] struct {
 //
 // Without options the migration strategy is AppendNewColumns{CreateIfMissing:
 // true}, which creates the table if it is absent and adds columns the declaration
-// gained, and the write strategy is &StorageWrite{}. Pass MigrationNone{} to leave
-// the table alone.
+// gained, its retries are DefaultRetryPolicy's, and the write strategy is
+// &StorageWrite{}. Pass MigrationNone{} to leave the table alone.
 //
 // New does not talk to BigQuery. Reconciliation with the real table happens in
 // Migrate, which the first Sink also triggers.
@@ -169,16 +169,17 @@ func New[T any](client *bigquery.Client, relation Relation, opts ...Option) (*Si
 		return nil, err
 	}
 	strategy := c.strategy
+	migrationRetry := c.migrationRetry
 	if strategy == nil {
+		// The default has to keep retrying: replicas deploying at the same time add
+		// the same column at the same time, and BigQuery reports that as a failed
+		// precondition which only a retry gets past.
 		strategy = AppendNewColumns{CreateIfMissing: true}
+		migrationRetry = DefaultRetryPolicy
 	}
 	writeStrategy := c.writeStrategy
 	if writeStrategy == nil {
 		writeStrategy = &StorageWrite{}
-	}
-	retryPolicy := c.retryPolicy
-	if retryPolicy == nil {
-		retryPolicy = DefaultRetryPolicy
 	}
 	logger := c.logger
 	if logger == nil {
@@ -195,22 +196,22 @@ func New[T any](client *bigquery.Client, relation Relation, opts ...Option) (*Si
 	}
 	table := relation.table(client)
 	return &Sinker[T]{
-		client:        client,
-		relation:      relation,
-		table:         table,
-		api:           table,
-		query:         clientQueryRunner{client: client},
-		plan:          plan,
-		schema:        schema,
-		metadata:      metadata,
-		strategy:      strategy,
-		writeStrategy: writeStrategy,
-		retryPolicy:   retryPolicy,
-		logger:        logger,
-		sinkerID:      sinkerID,
-		createdAt:     time.Now(),
-		filler:        filler,
-		now:           time.Now,
+		client:         client,
+		relation:       relation,
+		table:          table,
+		api:            table,
+		query:          clientQueryRunner{client: client},
+		plan:           plan,
+		schema:         schema,
+		metadata:       metadata,
+		strategy:       strategy,
+		migrationRetry: migrationRetry,
+		writeStrategy:  writeStrategy,
+		logger:         logger,
+		sinkerID:       sinkerID,
+		createdAt:      time.Now(),
+		filler:         filler,
+		now:            time.Now,
 	}, nil
 }
 
@@ -349,111 +350,112 @@ func (s *Sinker[T]) Relation() Relation {
 // from a failure means building a new Sinker. Since the work happens on the first
 // call, ctx belongs to that caller; a ctx cancelled later has no effect.
 //
-// Another process changing the same table concurrently, which BigQuery reports
-// as a failed ETag precondition or a conflict, is retried here according to the
-// retry policy.
+// Another process changing the same table concurrently, which BigQuery reports as
+// a failed ETag precondition or a conflict, is retried here according to the policy
+// WithMigrationStrategy settled on. That is the only thing a Sinker retries: a
+// write is retried by the write strategy, which is the one holding the rows.
 //
 // Sink calls Migrate on its first invocation, so calling it directly is only
 // necessary to apply schema changes ahead of time, such as during a deploy.
 func (s *Sinker[T]) Migrate(ctx context.Context) error {
-	s.migrateOnce.Do(func() { s.migrateErr = s.retrying(ctx, "migrate", s.migrate) })
+	s.migrateOnce.Do(func() {
+		s.migrateErr = retrying(ctx, s.logger, "migrate", s.migrationRetry, s.migrate)
+	})
 	return s.migrateErr
 }
 
-// Sink hands v to the write strategy, running Migrate on the first call.
+// Sink writes vs, running Migrate on the first call, and returns how many of them
+// reached BigQuery.
 //
-// If T implements RowFiller, FillRow is called on a copy of v first, so that the
-// row can fill in columns such as a write timestamp. That happens once, before
-// the conversion and before any retry.
+// The rows travel as one batch, so how many are given here is what decides how
+// much a load job carries or an append sends. Nothing is buffered between calls:
+// giving LoadJobs one row at a time submits a load job each time.
 //
-// A transient failure is retried under the retry policy, so a row can reach
+// Sink returns a non-nil error whenever n < len(vs), so that vs[n:] are exactly
+// the rows that did not land. The caller still holds them, which is what makes
+// dealing with them the caller's choice; nothing else records what was lost.
+// n counts rows written and not rows prepared: a row that cannot be converted
+// leaves n at 0 even though the rows before it were converted.
+//
+// If T implements RowFiller, FillRow is called on a copy of each element first, so
+// that the row can fill in columns such as a write timestamp. That happens once per
+// row, before the conversion and before any retry.
+//
+// A transient failure is retried by the write strategy, so a row can reach
 // BigQuery more than once. Neither transport bqsink ships deduplicates, so the
-// guarantee is at-least-once; IngestionMetadata's _ingestion_row_id is what makes those
-// duplicates identifiable.
-func (s *Sinker[T]) Sink(ctx context.Context, v T) error {
-	w, err := s.writer(ctx)
-	if err != nil {
-		return err
-	}
-	row, err := s.prepare(ctx, v)
-	if err != nil {
-		return err
-	}
-	return s.retrying(ctx, "append", func(ctx context.Context) error {
-		return w.Append(ctx, row)
-	})
-}
-
-// SinkAll hands every element of vs to the write strategy in order.
-//
-// Each row is retried on its own, so a failure part way through leaves the rows
-// before it handed over.
-func (s *Sinker[T]) SinkAll(ctx context.Context, vs ...T) error {
+// guarantee is at-least-once; IngestionMetadata's _ingestion_row_id is what makes
+// those duplicates identifiable.
+func (s *Sinker[T]) Sink(ctx context.Context, vs ...T) (int, error) {
 	if len(vs) == 0 {
-		return nil
+		return 0, nil
 	}
 	w, err := s.writer(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	for _, v := range vs {
+	rows := make([]Row, len(vs))
+	for i, v := range vs {
 		row, err := s.prepare(ctx, v)
 		if err != nil {
-			return err
+			return 0, err
 		}
-		err = s.retrying(ctx, "append", func(ctx context.Context) error {
-			return w.Append(ctx, row)
-		})
-		if err != nil {
-			return err
-		}
+		rows[i] = row
 	}
-	return nil
+	n, err := w.WriteRows(ctx, rows)
+	if err == nil && n != len(rows) {
+		// A writer that reports fewer rows than it was given owes an error saying so,
+		// the way bufio turns the same silence into io.ErrShortWrite. Letting it pass
+		// would be a row lost without a word, which is what bqsink exists to prevent.
+		return n, fmt.Errorf("bqsink: %T wrote %d of %d row(s) but reported no error", w, n, len(rows))
+	}
+	return n, err
 }
 
-// prepare lets the row fill its own columns in and then converts it. Both happen
-// once, before any retry, so a retried row carries the same values.
-func (s *Sinker[T]) prepare(ctx context.Context, v T) (map[string]bigquery.Value, error) {
+// prepare gives the row its id, lets it fill its own columns in and then converts
+// it. All of that happens once, before any retry, so a retried row carries the same
+// values.
+func (s *Sinker[T]) prepare(ctx context.Context, v T) (Row, error) {
+	rowID, err := newID()
+	if err != nil {
+		return Row{}, fmt.Errorf("bqsink: %w", err)
+	}
 	if s.filler != nil {
-		info, err := s.appendInfo()
-		if err != nil {
-			return nil, err
-		}
 		if filler := s.filler(&v); filler != nil {
+			info := AppendInfo{
+				Relation:        s.relation,
+				SinkerID:        s.sinkerID,
+				SinkerCreatedAt: s.createdAt,
+				RowID:           rowID,
+				Time:            s.now(),
+			}
 			if err := filler.FillRow(ctx, info); err != nil {
-				return nil, fmt.Errorf("bqsink: fill a row of %T: %w", v, err)
+				return Row{}, fmt.Errorf("bqsink: fill a row of %T: %w", v, err)
 			}
 		}
 	}
-	return s.toRow(v)
-}
-
-func (s *Sinker[T]) appendInfo() (AppendInfo, error) {
-	rowID, err := newID()
+	values, err := s.toRow(v)
 	if err != nil {
-		return AppendInfo{}, fmt.Errorf("bqsink: %w", err)
+		return Row{}, err
 	}
-	return AppendInfo{
-		Relation:        s.relation,
-		SinkerID:        s.sinkerID,
-		SinkerCreatedAt: s.createdAt,
-		RowID:           rowID,
-		Time:            s.now(),
-	}, nil
+	return Row{ID: rowID, Values: values}, nil
 }
 
-// retrying runs op, named by what for the log, under the configured retry policy.
+// retrying runs op, named by what for the log, under the policy newRetryer makes.
+// A nil newRetryer means op is run once.
 //
 // A failure that is retried is logged, because a later attempt succeeding leaves
 // the caller with no sign that it happened. It is logged on the way into the next
 // attempt rather than when it is returned, so that the failure op finally returns
 // is reported once, by the caller, and not logged here as well.
-func (s *Sinker[T]) retrying(ctx context.Context, what string, op func(context.Context) error) error {
+func retrying(ctx context.Context, logger *slog.Logger, what string, newRetryer func() gax.Retryer, op func(context.Context) error) error {
+	if newRetryer == nil {
+		return op(ctx)
+	}
 	var attempt int
 	var lastErr error
 	call := func(ctx context.Context, _ gax.CallSettings) error {
 		if lastErr != nil {
-			s.logger.WarnContext(ctx, "retrying after a failure a later attempt may get past",
+			logger.WarnContext(ctx, "retrying after a failure a later attempt may get past",
 				slog.String("operation", what),
 				slog.Int("attempt", attempt),
 				slog.Any("error", lastErr))
@@ -462,7 +464,7 @@ func (s *Sinker[T]) retrying(ctx context.Context, what string, op func(context.C
 		lastErr = op(ctx)
 		return lastErr
 	}
-	return gax.Invoke(ctx, call, gax.WithRetry(s.retryPolicy))
+	return gax.Invoke(ctx, call, gax.WithRetry(newRetryer))
 }
 
 // toRow turns a row of type T into the columns to write, reading the same plan
@@ -485,52 +487,18 @@ func (s *Sinker[T]) writer(ctx context.Context) (RowWriter, error) {
 	return s.rowWriter, s.writerErr
 }
 
-// Flush sends the rows the write strategy has buffered. It does nothing when no
-// row has been handed over yet.
+// Close releases what the write strategy holds. It does nothing when no row has
+// been handed over yet, since the writer is opened on first use.
 //
-// A transient failure is retried under the retry policy.
-//
-// Its error reports rows that never reached BigQuery, so it must not be discarded.
-func (s *Sinker[T]) Flush(ctx context.Context) error {
-	w := s.openedWriter()
-	if w == nil {
-		return nil
-	}
-	return s.retrying(ctx, "flush", w.Flush)
-}
-
-// Close flushes and releases the write strategy's resources. It does nothing when
-// no row has been handed over yet.
-//
-// The flush goes through Flush, so a transient failure is retried under the retry
-// policy the same way it is anywhere else. This is the last chance the rows get,
-// which is why it is not left to the writer's own Close.
-//
-// Like Flush, its error reports rows that never reached BigQuery. A plain
-// "defer s.Close(ctx)" throws that away and loses the rows silently; capture it
-// through a named return value instead.
-//
-//	func write(ctx context.Context, s *bqsink.Sinker[Row]) (err error) {
-//		defer func() {
-//			if cerr := s.Close(ctx); cerr != nil && err == nil {
-//				err = cerr
-//			}
-//		}()
-//		...
-//	}
+// No row is waiting for it: Sink writes the rows it is given before it returns, so
+// nothing is buffered for Close to send. Its error says that a connection did not
+// shut down cleanly, which is worth reporting but has cost no rows.
 func (s *Sinker[T]) Close(ctx context.Context) error {
 	w := s.openedWriter()
 	if w == nil {
 		return nil
 	}
-	err := s.Flush(ctx)
-	// The writer is closed whether or not the flush got through, so that a failure
-	// cannot leak the transport's connections. Rows that never landed matter more
-	// than an unclean shutdown, so the flush's error is the one that survives.
-	if cerr := w.Close(ctx); err == nil {
-		err = cerr
-	}
-	return err
+	return w.Close(ctx)
 }
 
 func (s *Sinker[T]) openedWriter() RowWriter {

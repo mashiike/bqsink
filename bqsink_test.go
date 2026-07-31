@@ -217,15 +217,15 @@ func TestNewUsesDefaultRetryPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	if s.retryPolicy == nil {
-		t.Fatal("retryPolicy = nil, want DefaultRetryPolicy")
+	if s.migrationRetry == nil {
+		t.Fatal("migrationRetry = nil, want DefaultRetryPolicy")
 	}
-	if s.retryPolicy() == nil {
-		t.Error("retryPolicy() = nil, want a gax.Retryer")
+	if s.migrationRetry() == nil {
+		t.Error("migrationRetry() = nil, want a gax.Retryer")
 	}
 }
 
-func TestNewWithRetryPolicyReplacesTheDefault(t *testing.T) {
+func TestWithMigrationStrategyReplacesTheDefaultRetryPolicy(t *testing.T) {
 	t.Parallel()
 
 	built := 0
@@ -233,14 +233,15 @@ func TestNewWithRetryPolicyReplacesTheDefault(t *testing.T) {
 		built++
 		return gax.OnErrorFunc(gax.Backoff{}, func(error) bool { return false })
 	}
-	s, err := New[simpleRow](testClient(t), testRelation(), WithRetryPolicy(replacement))
+	s, err := New[simpleRow](testClient(t), testRelation(),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, replacement))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
 	if built != 0 {
 		t.Errorf("the policy was built %d times during New, want 0", built)
 	}
-	if _, ok := s.retryPolicy().Retry(errors.New("boom")); ok {
+	if _, ok := s.migrationRetry().Retry(errors.New("boom")); ok {
 		t.Error("Retry() = true, want the replacement policy's false")
 	}
 	if built != 1 {
@@ -255,9 +256,8 @@ func TestNewRejectsBadOptions(t *testing.T) {
 		name string
 		opt  Option
 	}{
-		{name: "a nil migration strategy", opt: WithMigrationStrategy(nil)},
+		{name: "a nil migration strategy", opt: WithMigrationStrategy(nil, nil)},
 		{name: "a nil write strategy", opt: WithWriteStrategy(nil)},
-		{name: "a nil retry policy", opt: WithRetryPolicy(nil)},
 	}
 
 	for _, tt := range tests {
@@ -295,23 +295,23 @@ func TestNewUsesDefaultStrategies(t *testing.T) {
 	if _, ok := s.writeStrategy.(*StorageWrite); !ok {
 		t.Errorf("writeStrategy = %T, want *StorageWrite", s.writeStrategy)
 	}
-	if s.retryPolicy == nil {
-		t.Error("retryPolicy = nil, want DefaultRetryPolicy")
+	if s.migrationRetry == nil {
+		t.Error("migrationRetry = nil, want DefaultRetryPolicy")
 	}
 	if s.api == nil {
 		t.Error("api = nil, want the destination table")
 	}
 }
 
-func TestSinkAllWithNoRowsDoesNothing(t *testing.T) {
+func TestSinkWithNoRowsDoesNothing(t *testing.T) {
 	t.Parallel()
 
 	s, err := New[simpleRow](testClient(t), testRelation())
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	if err := s.SinkAll(context.Background()); err != nil {
-		t.Errorf("SinkAll() with no rows error = %v, want nil without contacting BigQuery", err)
+	if _, err := s.Sink(context.Background()); err != nil {
+		t.Errorf("Sink() with no rows error = %v, want nil without contacting BigQuery", err)
 	}
 }
 
@@ -330,12 +330,8 @@ func TestNewRejectsInvalidStrategies(t *testing.T) {
 			}),
 		},
 		{
-			name: "a LoadJobs with a negative threshold",
-			opt:  WithWriteStrategy(&LoadJobs{FlushRows: -1}),
-		},
-		{
 			name: "a SyncAllColumns ignoring an empty name",
-			opt:  WithMigrationStrategy(SyncAllColumns{IgnoreColumns: []string{""}}),
+			opt:  WithMigrationStrategy(SyncAllColumns{IgnoreColumns: []string{""}}, nil),
 		},
 	}
 

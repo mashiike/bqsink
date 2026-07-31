@@ -30,6 +30,9 @@ func (s *fakeWriteStrategy) Open(_ context.Context, table *bigquery.Table, schem
 	return s.writer, nil
 }
 
+// fakeRowWriter records what it is given, one WriteRows call at a time. It
+// returns 0 and writeErr when set, the way a real writer must when it lands
+// none of the rows it was given.
 type fakeRowWriter struct {
 	mu sync.Mutex
 
@@ -38,28 +41,30 @@ type fakeRowWriter struct {
 	openedTable  *bigquery.Table
 	openedLogger *slog.Logger
 
-	rows      []map[string]bigquery.Value
-	appendErr error
+	rows       []map[string]bigquery.Value
+	batchSizes []int
+	calls      int
+	writeErr   error
 
-	flushes int
-	closes  int
+	// underReport makes WriteRows claim it wrote this many fewer rows than it was
+	// given while returning no error, which the contract forbids.
+	underReport int
+
+	closes int
 }
 
-func (w *fakeRowWriter) Append(ctx context.Context, row map[string]bigquery.Value) error {
+func (w *fakeRowWriter) WriteRows(ctx context.Context, rows []Row) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.appendErr != nil {
-		return w.appendErr
+	w.calls++
+	w.batchSizes = append(w.batchSizes, len(rows))
+	if w.writeErr != nil {
+		return 0, w.writeErr
 	}
-	w.rows = append(w.rows, row)
-	return nil
-}
-
-func (w *fakeRowWriter) Flush(ctx context.Context) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.flushes++
-	return nil
+	for _, r := range rows {
+		w.rows = append(w.rows, r.Values)
+	}
+	return len(rows) - w.underReport, nil
 }
 
 func (w *fakeRowWriter) Close(ctx context.Context) error {
@@ -67,6 +72,27 @@ func (w *fakeRowWriter) Close(ctx context.Context) error {
 	defer w.mu.Unlock()
 	w.closes++
 	return nil
+}
+
+// TestSinkRejectsAWriterThatUnderReports covers the guard that turns a writer's
+// silence into an error, the way bufio turns a short underlying write into
+// io.ErrShortWrite. Without it a custom RowWriter could lose a row and have Sink
+// report success, which is the failure this whole interface exists to rule out.
+func TestSinkRejectsAWriterThatUnderReports(t *testing.T) {
+	t.Parallel()
+
+	writer := &fakeRowWriter{underReport: 1}
+	s := newTestSinker[nestedRow](t, migratedTable(),
+		WithMigrationStrategy(AppendNewColumns{}, nil),
+		WithWriteStrategy(&fakeWriteStrategy{writer: writer}))
+
+	n, err := s.Sink(t.Context(), nestedRow{}, nestedRow{})
+	if err == nil {
+		t.Fatal("Sink() error = nil, want a report that the writer left a row unaccounted for")
+	}
+	if n != 1 {
+		t.Errorf("Sink() n = %d, want the count the writer itself reported", n)
+	}
 }
 
 func TestOpenErrorIsCached(t *testing.T) {
@@ -81,20 +107,20 @@ func TestOpenErrorIsCached(t *testing.T) {
 	}}
 	sentinel := errors.New("cannot open")
 	strategy := &fakeWriteStrategy{writer: &fakeRowWriter{}, openErr: sentinel}
-	s := newTestSinker[nestedRow](t, fake, WithMigrationStrategy(AppendNewColumns{}), WithWriteStrategy(strategy))
+	s := newTestSinker[nestedRow](t, fake, WithMigrationStrategy(AppendNewColumns{}, nil), WithWriteStrategy(strategy))
 
 	ctx := t.Context()
 	for i := range 2 {
-		if err := s.Sink(ctx, nestedRow{}); !errors.Is(err, sentinel) {
+		if _, err := s.Sink(ctx, nestedRow{}); !errors.Is(err, sentinel) {
 			t.Fatalf("Sink() call %d error = %v, want the open failure", i+1, err)
 		}
 	}
-	if err := s.Flush(ctx); err != nil {
-		t.Errorf("Flush() error = %v, want nil while no writer opened", err)
+	if err := s.Close(ctx); err != nil {
+		t.Errorf("Close() error = %v, want nil while no writer opened", err)
 	}
 }
 
-func TestAppendErrorSurfaces(t *testing.T) {
+func TestSinkReturnsTheWriteError(t *testing.T) {
 	t.Parallel()
 
 	fake := &fakeTable{metadata: &bigquery.TableMetadata{
@@ -104,15 +130,82 @@ func TestAppendErrorSurfaces(t *testing.T) {
 			{Name: "B", Type: bigquery.IntegerFieldType},
 		},
 	}}
-	sentinel := errors.New("append refused")
-	writer := &fakeRowWriter{appendErr: sentinel}
+	sentinel := errors.New("write refused")
+	writer := &fakeRowWriter{writeErr: sentinel}
 	s := newTestSinker[nestedRow](t, fake,
-		WithMigrationStrategy(AppendNewColumns{}),
+		WithMigrationStrategy(AppendNewColumns{}, nil),
 		WithWriteStrategy(&fakeWriteStrategy{writer: writer}),
 	)
 
-	if err := s.Sink(t.Context(), nestedRow{}); !errors.Is(err, sentinel) {
-		t.Errorf("Sink() error = %v, want the append failure", err)
+	n, err := s.Sink(t.Context(), nestedRow{})
+	if !errors.Is(err, sentinel) {
+		t.Errorf("Sink() error = %v, want the write failure", err)
+	}
+	if n != 0 {
+		t.Errorf("Sink() n = %d, want 0", n)
+	}
+}
+
+// TestSinkDoesNotRetryAWriteFailure checks that the Sinker leaves retrying a
+// write to the write strategy: a writer that fails once is called exactly once
+// and its failure is returned as is, even for an error that looks transient.
+func TestSinkDoesNotRetryAWriteFailure(t *testing.T) {
+	t.Parallel()
+
+	writer := &fakeRowWriter{writeErr: unavailableErr()}
+	s := newTestSinker[nestedRow](t, migratedTable(),
+		WithWriteStrategy(&fakeWriteStrategy{writer: writer}),
+	)
+
+	if _, err := s.Sink(t.Context(), nestedRow{}); err == nil {
+		t.Fatal("Sink() error = nil, want the write failure")
+	}
+	writer.mu.Lock()
+	calls := writer.calls
+	writer.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("WriteRows was called %d times, want 1; the Sinker must not retry a write", calls)
+	}
+}
+
+// TestSinkSendsAllRowsInOneWriteRowsCall checks that the rows given to one Sink
+// call travel together, rather than one at a time.
+func TestSinkSendsAllRowsInOneWriteRowsCall(t *testing.T) {
+	t.Parallel()
+
+	writer := &fakeRowWriter{}
+	s := newTestSinker[nestedRow](t, migratedTable(),
+		WithWriteStrategy(&fakeWriteStrategy{writer: writer}),
+	)
+
+	n, err := s.Sink(t.Context(), nestedRow{A: "one"}, nestedRow{A: "two"}, nestedRow{A: "three"})
+	if err != nil {
+		t.Fatalf("Sink() error = %v", err)
+	}
+	if n != 3 {
+		t.Errorf("Sink() n = %d, want 3", n)
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if writer.calls != 1 {
+		t.Errorf("WriteRows was called %d times, want 1", writer.calls)
+	}
+	if len(writer.batchSizes) != 1 || writer.batchSizes[0] != 3 {
+		t.Errorf("batch sizes = %v, want a single call of 3", writer.batchSizes)
+	}
+}
+
+func TestSinkWithNoRowsReturnsZero(t *testing.T) {
+	t.Parallel()
+
+	s := newTestSinker[nestedRow](t, migratedTable())
+
+	n, err := s.Sink(t.Context())
+	if err != nil {
+		t.Errorf("Sink() with no rows error = %v, want nil without contacting BigQuery", err)
+	}
+	if n != 0 {
+		t.Errorf("Sink() n = %d, want 0", n)
 	}
 }
 
@@ -127,28 +220,6 @@ func TestLoadJobsOpenDoesNotFail(t *testing.T) {
 	}
 	if w == nil {
 		t.Fatal("Open() returned a nil writer")
-	}
-}
-
-func TestLoadJobsFlushRowsDefault(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		set  int
-		want int
-	}{
-		{name: "unset means the default", set: 0, want: DefaultFlushRows},
-		{name: "a positive value is kept", set: 250, want: 250},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if got := (&LoadJobs{FlushRows: tt.set}).flushRows(); got != tt.want {
-				t.Errorf("flushRows() = %d, want %d", got, tt.want)
-			}
-		})
 	}
 }
 
@@ -197,8 +268,6 @@ func TestWriteStrategyValidate(t *testing.T) {
 			wantErr:  true,
 		},
 		{name: "an empty LoadJobs is fine", strategy: &LoadJobs{}},
-		{name: "a positive threshold is fine", strategy: &LoadJobs{FlushRows: 500}},
-		{name: "a negative threshold is rejected", strategy: &LoadJobs{FlushRows: -1}, wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -215,76 +284,8 @@ func TestWriteStrategyValidate(t *testing.T) {
 	}
 }
 
-// flakyWriteStrategy hands out a writer that fails a set number of times before
-// succeeding, so the Sinker's retry can be observed.
-type flakyWriteStrategy struct {
-	writer *flakyRowWriter
-}
-
-func (s *flakyWriteStrategy) Open(_ context.Context, _ *bigquery.Table, _ bigquery.Schema, _ *slog.Logger) (RowWriter, error) {
-	return s.writer, nil
-}
-
-type flakyRowWriter struct {
-	mu sync.Mutex
-
-	// failAppends is how many Append calls fail before one succeeds.
-	failAppends int
-	appendErr   error
-
-	appends int
-	rows    []map[string]bigquery.Value
-
-	failFlushes int
-	flushes     int
-
-	closed bool
-}
-
-func (w *flakyRowWriter) Append(ctx context.Context, row map[string]bigquery.Value) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.appends++
-	if w.failAppends > 0 {
-		w.failAppends--
-		return w.appendErr
-	}
-	w.rows = append(w.rows, row)
-	return nil
-}
-
-func (w *flakyRowWriter) Flush(ctx context.Context) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.flushes++
-	if w.failFlushes > 0 {
-		w.failFlushes--
-		return w.appendErr
-	}
-	return nil
-}
-
-// Close flushes the way a real writer's does, so that what the Sinker asks of it
-// can be counted.
-func (w *flakyRowWriter) Close(ctx context.Context) error {
-	w.mu.Lock()
-	w.closed = true
-	w.mu.Unlock()
-	return w.Flush(ctx)
-}
-
-func (w *flakyRowWriter) counts() (appends, flushes, rows int) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.appends, w.flushes, len(w.rows)
-}
-
-func (w *flakyRowWriter) wasClosed() bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.closed
-}
-
+// migratedTable builds a fake table whose schema already matches, so that
+// Migrate has nothing to do.
 func migratedTable() *fakeTable {
 	return &fakeTable{metadata: &bigquery.TableMetadata{
 		ETag: "etag-1",
@@ -293,148 +294,6 @@ func migratedTable() *fakeTable {
 			{Name: "B", Type: bigquery.IntegerFieldType},
 		},
 	}}
-}
-
-func TestSinkRetriesATransientAppendFailure(t *testing.T) {
-	t.Parallel()
-
-	writer := &flakyRowWriter{failAppends: 2, appendErr: unavailableErr()}
-	s := newTestSinker[nestedRow](t, migratedTable(),
-		WithMigrationStrategy(AppendNewColumns{}),
-		WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
-	)
-
-	if err := s.Sink(t.Context(), nestedRow{A: "a", B: 1}); err != nil {
-		t.Fatalf("Sink() error = %v, want the retry to get through", err)
-	}
-	appends, _, rows := writer.counts()
-	if appends != 3 {
-		t.Errorf("Append was called %d times, want 3 (two failures then a success)", appends)
-	}
-	if rows != 1 {
-		t.Errorf("%d row(s) landed, want 1", rows)
-	}
-}
-
-func TestSinkDoesNotRetryAPermanentFailure(t *testing.T) {
-	t.Parallel()
-
-	writer := &flakyRowWriter{failAppends: 1, appendErr: forbiddenErr()}
-	s := newTestSinker[nestedRow](t, migratedTable(),
-		WithMigrationStrategy(AppendNewColumns{}),
-		WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
-	)
-
-	if err := s.Sink(t.Context(), nestedRow{}); err == nil {
-		t.Fatal("Sink() error = nil, want the permission failure")
-	}
-	if appends, _, _ := writer.counts(); appends != 1 {
-		t.Errorf("Append was called %d times, want 1; a permission failure must not be retried", appends)
-	}
-}
-
-func TestSinkGivesUpAfterTheRetryLimit(t *testing.T) {
-	t.Parallel()
-
-	writer := &flakyRowWriter{failAppends: 99, appendErr: unavailableErr()}
-	s := newTestSinker[nestedRow](t, migratedTable(),
-		WithMigrationStrategy(AppendNewColumns{}),
-		WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
-	)
-
-	if err := s.Sink(t.Context(), nestedRow{}); err == nil {
-		t.Fatal("Sink() error = nil, want the last failure")
-	}
-	if appends, _, _ := writer.counts(); appends != migrateMaxRetries+1 {
-		t.Errorf("Append was called %d times, want %d", appends, migrateMaxRetries+1)
-	}
-}
-
-func TestFlushRetriesATransientFailure(t *testing.T) {
-	t.Parallel()
-
-	writer := &flakyRowWriter{failFlushes: 1, appendErr: unavailableErr()}
-	s := newTestSinker[nestedRow](t, migratedTable(),
-		WithMigrationStrategy(AppendNewColumns{}),
-		WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
-	)
-
-	ctx := t.Context()
-	if err := s.Sink(ctx, nestedRow{}); err != nil {
-		t.Fatalf("Sink() error = %v", err)
-	}
-	if err := s.Flush(ctx); err != nil {
-		t.Fatalf("Flush() error = %v, want the retry to get through", err)
-	}
-	if _, flushes, _ := writer.counts(); flushes != 2 {
-		t.Errorf("Flush was called %d times, want 2 (one failure then a success)", flushes)
-	}
-}
-
-func TestCloseRetriesATransientFlushFailure(t *testing.T) {
-	t.Parallel()
-
-	writer := &flakyRowWriter{failFlushes: 1, appendErr: unavailableErr()}
-	s := newTestSinker[nestedRow](t, migratedTable(),
-		WithMigrationStrategy(AppendNewColumns{}),
-		WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
-	)
-
-	ctx := t.Context()
-	if err := s.Sink(ctx, nestedRow{}); err != nil {
-		t.Fatalf("Sink() error = %v", err)
-	}
-	if err := s.Close(ctx); err != nil {
-		t.Fatalf("Close() error = %v, want the retry to save the rows", err)
-	}
-	// Two from the retried flush Close asks for, and one more from the writer's own
-	// Close, which flushes an empty buffer.
-	if _, flushes, _ := writer.counts(); flushes != 3 {
-		t.Errorf("Flush was called %d times, want 3 (one failure, one success, then the writer's own Close)", flushes)
-	}
-}
-
-func TestCloseClosesTheWriterEvenWhenTheFlushFails(t *testing.T) {
-	t.Parallel()
-
-	writer := &flakyRowWriter{failFlushes: 99, appendErr: unavailableErr()}
-	s := newTestSinker[nestedRow](t, migratedTable(),
-		WithMigrationStrategy(AppendNewColumns{}),
-		WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
-	)
-
-	ctx := t.Context()
-	if err := s.Sink(ctx, nestedRow{}); err != nil {
-		t.Fatalf("Sink() error = %v", err)
-	}
-	if err := s.Close(ctx); err == nil {
-		t.Fatal("Close() error = nil, want the failure that lost the rows")
-	}
-	if !writer.wasClosed() {
-		t.Error("the writer was not closed, which leaks the transport's connections")
-	}
-}
-
-func TestSinkAllRetriesEachRow(t *testing.T) {
-	t.Parallel()
-
-	writer := &flakyRowWriter{failAppends: 1, appendErr: unavailableErr()}
-	s := newTestSinker[nestedRow](t, migratedTable(),
-		WithMigrationStrategy(AppendNewColumns{}),
-		WithWriteStrategy(&flakyWriteStrategy{writer: writer}),
-	)
-
-	err := s.SinkAll(t.Context(), nestedRow{A: "one"}, nestedRow{A: "two"})
-	if err != nil {
-		t.Fatalf("SinkAll() error = %v", err)
-	}
-	appends, _, rows := writer.counts()
-	if appends != 3 {
-		t.Errorf("Append was called %d times, want 3 (a retry on the first row)", appends)
-	}
-	if rows != 2 {
-		t.Errorf("%d row(s) landed, want 2", rows)
-	}
 }
 
 // migratedTableFor builds a fake table whose schema already matches, so that
@@ -447,42 +306,4 @@ func appendedRows(w *fakeRowWriter) []map[string]bigquery.Value {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.rows
-}
-
-// recordingFlakyStrategy hands out a writer that records every attempt, including
-// the failed ones, so a retry can be inspected.
-type recordingFlakyStrategy struct {
-	writer *recordingFlakyWriter
-}
-
-func (s *recordingFlakyStrategy) Open(_ context.Context, _ *bigquery.Table, _ bigquery.Schema, _ *slog.Logger) (RowWriter, error) {
-	return s.writer, nil
-}
-
-type recordingFlakyWriter struct {
-	mu sync.Mutex
-
-	failAppends int
-	appendErr   error
-	attempts    []map[string]bigquery.Value
-}
-
-func (w *recordingFlakyWriter) Append(ctx context.Context, row map[string]bigquery.Value) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.attempts = append(w.attempts, row)
-	if w.failAppends > 0 {
-		w.failAppends--
-		return w.appendErr
-	}
-	return nil
-}
-
-func (w *recordingFlakyWriter) Flush(ctx context.Context) error { return nil }
-func (w *recordingFlakyWriter) Close(ctx context.Context) error { return nil }
-
-func (w *recordingFlakyWriter) seenRows() []map[string]bigquery.Value {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.attempts
 }

@@ -97,7 +97,7 @@ func TestIngestionMetadataIsFilledIn(t *testing.T) {
 	s := newTestSinker[metadataRow](t, fake, WithWriteStrategy(&fakeWriteStrategy{writer: writer}))
 
 	before := time.Now()
-	if err := s.Sink(t.Context(), metadataRow{UserID: "u1"}); err != nil {
+	if _, err := s.Sink(t.Context(), metadataRow{UserID: "u1"}); err != nil {
 		t.Fatalf("Sink() error = %v", err)
 	}
 	rows := appendedRows(writer)
@@ -144,13 +144,13 @@ func TestIDsAreVersion7(t *testing.T) {
 		t.Errorf("the Sinker's id is version %d, want 7 so that ids sort by time", got)
 	}
 
-	info, err := s.appendInfo()
+	row, err := s.prepare(t.Context(), metadataRow{})
 	if err != nil {
-		t.Fatalf("appendInfo() error = %v", err)
+		t.Fatalf("prepare() error = %v", err)
 	}
-	rowID, err := uuid.Parse(info.RowID)
+	rowID, err := uuid.Parse(row.ID)
 	if err != nil {
-		t.Fatalf("the row id %q is not a UUID: %v", info.RowID, err)
+		t.Fatalf("the row id %q is not a UUID: %v", row.ID, err)
 	}
 	if got := rowID.Version(); got != 7 {
 		t.Errorf("the row id is version %d, want 7", got)
@@ -168,14 +168,14 @@ func TestRowIDsSortByTime(t *testing.T) {
 	}
 	var previous string
 	for i := range 50 {
-		info, err := s.appendInfo()
+		row, err := s.prepare(t.Context(), metadataRow{})
 		if err != nil {
-			t.Fatalf("appendInfo() error = %v", err)
+			t.Fatalf("prepare() error = %v", err)
 		}
-		if previous != "" && info.RowID <= previous {
-			t.Fatalf("row id %d (%q) does not sort after %q", i, info.RowID, previous)
+		if previous != "" && row.ID <= previous {
+			t.Fatalf("row id %d (%q) does not sort after %q", i, row.ID, previous)
 		}
-		previous = info.RowID
+		previous = row.ID
 	}
 }
 
@@ -191,13 +191,13 @@ func TestEachRowGetsItsOwnID(t *testing.T) {
 	writer := &fakeRowWriter{}
 	s := newTestSinker[metadataRow](t, fake, WithWriteStrategy(&fakeWriteStrategy{writer: writer}))
 
-	err := s.SinkAll(t.Context(),
+	_, err := s.Sink(t.Context(),
 		metadataRow{UserID: "u1"},
 		metadataRow{UserID: "u2"},
 		metadataRow{UserID: "u3"},
 	)
 	if err != nil {
-		t.Fatalf("SinkAll() error = %v", err)
+		t.Fatalf("Sink() error = %v", err)
 	}
 	rows := appendedRows(writer)
 	if len(rows) != 3 {
@@ -219,41 +219,6 @@ func TestEachRowGetsItsOwnID(t *testing.T) {
 	}
 }
 
-// TestRetryKeepsTheSameRowID is what makes _ingestion_row_id usable for
-// deduplication: at-least-once delivery must write the same id twice, not two.
-func TestRetryKeepsTheSameRowID(t *testing.T) {
-	t.Parallel()
-
-	fake := migratedTableFor(bigquery.Schema{
-		{Name: "_ingestion_at", Type: bigquery.TimestampFieldType},
-		{Name: "_ingestion_id", Type: bigquery.StringFieldType},
-		{Name: "_ingestion_row_id", Type: bigquery.StringFieldType},
-		{Name: "user_id", Type: bigquery.StringFieldType},
-	})
-	writer := &recordingFlakyWriter{failAppends: 2, appendErr: unavailableErr()}
-	s := newTestSinker[metadataRow](t, fake, WithWriteStrategy(&recordingFlakyStrategy{writer: writer}))
-
-	if err := s.Sink(t.Context(), metadataRow{UserID: "u1"}); err != nil {
-		t.Fatalf("Sink() error = %v", err)
-	}
-	seen := writer.seenRows()
-	if len(seen) != 3 {
-		t.Fatalf("Append was called %d times, want 3 (two failures then a success)", len(seen))
-	}
-	first, ok := seen[0]["_ingestion_row_id"].(string)
-	if !ok {
-		t.Fatalf("the first attempt has no _ingestion_row_id")
-	}
-	for i, row := range seen[1:] {
-		if got := row["_ingestion_row_id"]; got != first {
-			t.Errorf("attempt %d used the id %#v, want the same %q so duplicates can be spotted", i+2, got, first)
-		}
-	}
-	if seen[0]["_ingestion_at"] != seen[2]["_ingestion_at"] {
-		t.Error("_ingestion_at changed between attempts, want it fixed by the first")
-	}
-}
-
 func TestCustomFillRow(t *testing.T) {
 	t.Parallel()
 
@@ -266,7 +231,7 @@ func TestCustomFillRow(t *testing.T) {
 	writer := &fakeRowWriter{}
 	s := newTestSinker[customFillRow](t, fake, WithWriteStrategy(&fakeWriteStrategy{writer: writer}))
 
-	if err := s.Sink(t.Context(), customFillRow{UserID: "u1"}); err != nil {
+	if _, err := s.Sink(t.Context(), customFillRow{UserID: "u1"}); err != nil {
 		t.Fatalf("Sink() error = %v", err)
 	}
 	rows := appendedRows(writer)
@@ -309,7 +274,7 @@ func TestPointerTypeParameterCanFill(t *testing.T) {
 	s := newTestSinker[*customFillRow](t, fake, WithWriteStrategy(&fakeWriteStrategy{writer: writer}))
 
 	row := &customFillRow{UserID: "u1"}
-	if err := s.Sink(t.Context(), row); err != nil {
+	if _, err := s.Sink(t.Context(), row); err != nil {
 		t.Fatalf("Sink() error = %v", err)
 	}
 	// With a pointer type parameter the fill reaches the caller's own value, which
@@ -326,8 +291,12 @@ func TestFillRowFailureStopsTheWrite(t *testing.T) {
 	writer := &fakeRowWriter{}
 	s := newTestSinker[failingFillRow](t, fake, WithWriteStrategy(&fakeWriteStrategy{writer: writer}))
 
-	if err := s.Sink(t.Context(), failingFillRow{}); !errors.Is(err, errFillFailed) {
+	n, err := s.Sink(t.Context(), failingFillRow{})
+	if !errors.Is(err, errFillFailed) {
 		t.Errorf("Sink() error = %v, want the fill failure", err)
+	}
+	if n != 0 {
+		t.Errorf("Sink() n = %d, want 0; a row that failed to prepare must not count as written", n)
 	}
 	if rows := appendedRows(writer); len(rows) != 0 {
 		t.Errorf("%d row(s) were appended, want 0", len(rows))
@@ -343,5 +312,47 @@ func TestRowWithoutAFillerIsUntouched(t *testing.T) {
 	}
 	if s.filler != nil {
 		t.Error("filler is set for a type that does not implement RowFiller")
+	}
+}
+
+// TestPrepareAlwaysGeneratesARowID checks that Row.ID is set even for a type
+// that does not implement RowFiller, since it is what a transport names the row
+// by and what _ingestion_row_id gets when the row type does fill it in.
+func TestPrepareAlwaysGeneratesARowID(t *testing.T) {
+	t.Parallel()
+
+	s, err := New[simpleRow](testClient(t), testRelation())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	row, err := s.prepare(t.Context(), simpleRow{Name: "a"})
+	if err != nil {
+		t.Fatalf("prepare() error = %v", err)
+	}
+	if _, err := uuid.Parse(row.ID); err != nil {
+		t.Errorf("Row.ID = %q is not a UUID: %v", row.ID, err)
+	}
+}
+
+// TestRowIDMatchesTheIngestionRowIDColumn checks the other half of Row.ID's
+// contract: a transport naming a row by it, as describeRowErrors does, is naming
+// the same row the _ingestion_row_id column identifies.
+func TestRowIDMatchesTheIngestionRowIDColumn(t *testing.T) {
+	t.Parallel()
+
+	s, err := New[metadataRow](testClient(t), testRelation())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	row, err := s.prepare(t.Context(), metadataRow{UserID: "u1"})
+	if err != nil {
+		t.Fatalf("prepare() error = %v", err)
+	}
+	column, ok := row.Values["_ingestion_row_id"].(string)
+	if !ok {
+		t.Fatalf("_ingestion_row_id = %#v, want a string", row.Values["_ingestion_row_id"])
+	}
+	if column != row.ID {
+		t.Errorf("_ingestion_row_id = %q, want Row.ID %q", column, row.ID)
 	}
 }
