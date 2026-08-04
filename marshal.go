@@ -9,7 +9,7 @@ import (
 )
 
 // FieldMarshaler lets a Go type declare the BigQuery column it becomes,
-// overriding what InferSchema would derive from the Go type alone.
+// overriding what bqsink would otherwise derive from the Go type alone.
 //
 // Implementing it settles both halves of the mapping at once:
 // BigQueryFieldType says what the column is in the schema, and
@@ -71,8 +71,8 @@ type typeMarshaler struct {
 // from a field type alone; spell such a column out in BigQueryTableMetadata.
 //
 // A problem with the arguments is reported when the result reaches
-// WithMarshalers or InferSchema, since a constructor cannot return an error and
-// stay usable inline.
+// WithMarshalers, since a constructor cannot return an error and stay usable
+// inline.
 func MarshalFunc[T any](fieldType bigquery.FieldType, fn func(T) (bigquery.Value, error)) *Marshalers {
 	goType := reflect.TypeFor[T]()
 	if goType.Kind() == reflect.Pointer {

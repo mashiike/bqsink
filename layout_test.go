@@ -57,9 +57,9 @@ func TestLayoutFromTags(t *testing.T) {
 func TestDescriptionReachesTheSchema(t *testing.T) {
 	t.Parallel()
 
-	schema, err := InferSchema[layoutRow]()
+	schema, err := inferSchema[layoutRow]()
 	if err != nil {
-		t.Fatalf("InferSchema() error = %v", err)
+		t.Fatalf("inferSchema() error = %v", err)
 	}
 	var amount *bigquery.FieldSchema
 	for _, f := range schema {
@@ -256,87 +256,87 @@ func TestLayoutIsValidated(t *testing.T) {
 	}{
 		{
 			name: "two partitioning columns",
-			fn:   InferSchema[twoPartitionsRow],
+			fn:   inferSchema[twoPartitionsRow],
 			want: "one partitioning column",
 		},
 		{
 			name: "a STRING partitioning column",
-			fn:   InferSchema[stringPartitionRow],
+			fn:   inferSchema[stringPartitionRow],
 			want: "TIMESTAMP, DATE or DATETIME",
 		},
 		{
 			name: "an INTEGER partitioning column",
-			fn:   InferSchema[integerPartitionRow],
+			fn:   inferSchema[integerPartitionRow],
 			want: "TIMESTAMP, DATE or DATETIME",
 		},
 		{
 			name: "hourly partitioning on a DATE column",
-			fn:   InferSchema[hourlyDateRow],
+			fn:   inferSchema[hourlyDateRow],
 			want: "cannot be partitioned by hour",
 		},
 		{
 			name: `hourly partitioning on a time.Time tagged "date"`,
-			fn:   InferSchema[hourlyTaggedDateRow],
+			fn:   inferSchema[hourlyTaggedDateRow],
 			want: "cannot be partitioned by hour",
 		},
 		{
 			name: `partitioning on a time.Time tagged "time"`,
-			fn:   InferSchema[dailyTaggedTimeRow],
+			fn:   inferSchema[dailyTaggedTimeRow],
 			want: "TIMESTAMP, DATE or DATETIME",
 		},
 		{
 			name: "a repeated partitioning column",
-			fn:   InferSchema[repeatedPartitionRow],
+			fn:   inferSchema[repeatedPartitionRow],
 			want: "repeated",
 		},
 		{
 			name: "five clustering columns",
-			fn:   InferSchema[fiveClusterRow],
+			fn:   inferSchema[fiveClusterRow],
 			want: "position from 1 to 4",
 		},
 		{
 			name: "two columns at the same position",
-			fn:   InferSchema[duplicateClusterRow],
+			fn:   inferSchema[duplicateClusterRow],
 			want: "both claim",
 		},
 		{
 			name: "a gap in the positions",
-			fn:   InferSchema[gappedClusterRow],
+			fn:   inferSchema[gappedClusterRow],
 			want: "without a gap",
 		},
 		{
 			name: "clustering on FLOAT",
-			fn:   InferSchema[floatClusterRow],
+			fn:   inferSchema[floatClusterRow],
 			want: "cannot cluster on",
 		},
 		{
 			name: "clustering on JSON",
-			fn:   InferSchema[jsonClusterRow],
+			fn:   inferSchema[jsonClusterRow],
 			want: "cannot cluster on",
 		},
 		{
 			name: "clustering on BYTES",
-			fn:   InferSchema[bytesClusterRow],
+			fn:   inferSchema[bytesClusterRow],
 			want: "cannot cluster on",
 		},
 		{
 			name: "clustering on a repeated column",
-			fn:   InferSchema[repeatedClusterRow],
+			fn:   inferSchema[repeatedClusterRow],
 			want: "repeated",
 		},
 		{
 			name: "an unknown granularity",
-			fn:   InferSchema[badGranularityRow],
+			fn:   inferSchema[badGranularityRow],
 			want: "want day, hour, month or year",
 		},
 		{
 			name: "a cluster position that is not a number",
-			fn:   InferSchema[badClusterPositionRow],
+			fn:   inferSchema[badClusterPositionRow],
 			want: "want a position",
 		},
 		{
 			name: "an unknown partition option",
-			fn:   InferSchema[unknownPartitionOptionRow],
+			fn:   inferSchema[unknownPartitionOptionRow],
 			want: "unknown option",
 		},
 	}

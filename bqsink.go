@@ -1,17 +1,3 @@
-// Package bqsink writes rows to BigQuery and keeps the destination table's
-// schema in sync with a schema declared in Go code.
-//
-// The declaration is the source of truth: the real table follows it, and bqsink
-// never infers a schema from the data being written. What the table looks like is
-// said by the row type and nowhere else — its struct tags, and its
-// BigQueryTableMetadata method for what tags cannot express. No Option describes
-// the table, since a row type carries the domain knowledge that gives its columns
-// meaning, and two places to say what a table is means two answers to keep
-// agreeing.
-//
-// The Options settle how bqsink behaves around that declaration: what to do about a
-// difference between it and the real table, how rows travel, what gets logged, and
-// how a transient failure is retried.
 package bqsink
 
 import (
@@ -121,11 +107,11 @@ type Sinker[T any] struct {
 // New returns a Sinker that writes rows of type T to the table relation names.
 //
 // What the table should look like is declared by T alone, and no Option changes
-// that. The schema comes from its struct tags, following the rules described on
-// InferSchema, and table level settings from its BigQueryTableMetadata method when
-// T implements TableDefiner. That method's Schema field, when set, takes the place
-// of the derived schema, which is how a column struct tags cannot describe gets
-// declared.
+// that. The schema comes from its struct tags, following the rules the package
+// documentation sets out under "Declaring the columns", and table level settings
+// from its BigQueryTableMetadata method when T implements TableDefiner. That
+// method's Schema field, when set, takes the place of the derived schema, which is
+// how a column struct tags cannot describe gets declared.
 //
 // T must be mappable to a row even when it spells its schema out, since its fields
 // are what gets written. Every column the struct would write has to be present in

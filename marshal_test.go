@@ -69,9 +69,9 @@ func jsonMarshalers() *Marshalers {
 func TestFieldMarshalerShapesTheSchema(t *testing.T) {
 	t.Parallel()
 
-	got, err := InferSchema[marshalerRow](jsonMarshalers())
+	got, err := inferSchema[marshalerRow](jsonMarshalers())
 	if err != nil {
-		t.Fatalf("InferSchema() error = %v", err)
+		t.Fatalf("inferSchema() error = %v", err)
 	}
 	want := bigquery.Schema{
 		{Name: "Payload", Type: bigquery.JSONFieldType},
@@ -80,19 +80,19 @@ func TestFieldMarshalerShapesTheSchema(t *testing.T) {
 		{Name: "External", Type: bigquery.JSONFieldType},
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("InferSchema() mismatch\n got: %s\nwant: %s", formatSchema(got), formatSchema(want))
+		t.Errorf("inferSchema() mismatch\n got: %s\nwant: %s", formatSchema(got), formatSchema(want))
 	}
 }
 
 func TestAnExternalTypeIsJSONEitherWay(t *testing.T) {
 	t.Parallel()
 
-	got, err := InferSchema[marshalerRow]()
+	got, err := inferSchema[marshalerRow]()
 	if err != nil {
-		t.Fatalf("InferSchema() error = %v", err)
+		t.Fatalf("inferSchema() error = %v", err)
 	}
 	if len(got) != 4 {
-		t.Fatalf("InferSchema() returned %d columns, want 4", len(got))
+		t.Fatalf("inferSchema() returned %d columns, want 4", len(got))
 	}
 	// Without a marshaler the struct still becomes JSON, since that is the default
 	// for a type carrying structure. Registering one settles how it is encoded.
@@ -133,9 +133,9 @@ func TestRegisteredMarshalerBeatsFieldMarshaler(t *testing.T) {
 	override := MarshalFunc(bigquery.StringFieldType, func(p payload) (bigquery.Value, error) {
 		return "overridden", nil
 	})
-	got, err := InferSchema[marshalerRow](jsonMarshalers(), override)
+	got, err := inferSchema[marshalerRow](jsonMarshalers(), override)
 	if err != nil {
-		t.Fatalf("InferSchema() error = %v", err)
+		t.Fatalf("inferSchema() error = %v", err)
 	}
 	if got[0].Type != bigquery.StringFieldType {
 		t.Errorf("Payload type = %s, want STRING from the registered marshaler", got[0].Type)
@@ -151,9 +151,9 @@ func TestMarshalersRegisteredLastWins(t *testing.T) {
 	second := MarshalFunc(bigquery.BytesFieldType, func(e external) (bigquery.Value, error) {
 		return []byte("second"), nil
 	})
-	got, err := InferSchema[marshalerRow](first, second)
+	got, err := inferSchema[marshalerRow](first, second)
 	if err != nil {
-		t.Fatalf("InferSchema() error = %v", err)
+		t.Fatalf("inferSchema() error = %v", err)
 	}
 	if got[3].Type != bigquery.BytesFieldType {
 		t.Errorf("External type = %s, want BYTES from the marshaler registered last", got[3].Type)
@@ -165,8 +165,8 @@ func TestRecordDeclaringMarshalerIsRejected(t *testing.T) {
 
 	t.Run("through FieldMarshaler", func(t *testing.T) {
 		t.Parallel()
-		if _, err := InferSchema[recordDeclaringRow](); err == nil {
-			t.Fatal("InferSchema() error = nil, want a rejection of the RECORD type")
+		if _, err := inferSchema[recordDeclaringRow](); err == nil {
+			t.Fatal("inferSchema() error = nil, want a rejection of the RECORD type")
 		}
 	})
 
@@ -175,8 +175,8 @@ func TestRecordDeclaringMarshalerIsRejected(t *testing.T) {
 		bad := MarshalFunc(bigquery.RecordFieldType, func(e external) (bigquery.Value, error) {
 			return nil, nil
 		})
-		if _, err := InferSchema[marshalerRow](bad); err == nil {
-			t.Fatal("InferSchema() error = nil, want a rejection of the RECORD type")
+		if _, err := inferSchema[marshalerRow](bad); err == nil {
+			t.Fatal("inferSchema() error = nil, want a rejection of the RECORD type")
 		}
 	})
 }

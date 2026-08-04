@@ -242,22 +242,22 @@ func TestTimeColumnOptionsAreValidated(t *testing.T) {
 	}{
 		{
 			name: `"date" on a string`,
-			fn:   InferSchema[dateOnStringRow],
+			fn:   inferSchema[dateOnStringRow],
 			want: "needs a time.Time",
 		},
 		{
 			name: `"date" on a named type whose underlying type is time.Time`,
-			fn:   InferSchema[dateOnNamedTimeRow],
+			fn:   inferSchema[dateOnNamedTimeRow],
 			want: "needs a time.Time",
 		},
 		{
 			name: "two options naming the type",
-			fn:   InferSchema[twoTimeTypesRow],
+			fn:   inferSchema[twoTimeTypesRow],
 			want: "a column has one type",
 		},
 		{
 			name: `"date" together with "record"`,
-			fn:   InferSchema[dateAndRecordRow],
+			fn:   inferSchema[dateAndRecordRow],
 			want: "a column has one type",
 		},
 	}
@@ -284,12 +284,12 @@ func TestTimeColumnOptionConflictingWithAMarshalerIsRejected(t *testing.T) {
 	m := MarshalFunc(bigquery.StringFieldType, func(v time.Time) (bigquery.Value, error) {
 		return v.Format(time.RFC3339), nil
 	})
-	_, err := InferSchema[timeColumnRow](m)
+	_, err := inferSchema[timeColumnRow](m)
 	if err == nil {
-		t.Fatal("InferSchema() error = nil, want the contradiction to be rejected")
+		t.Fatal("inferSchema() error = nil, want the contradiction to be rejected")
 	}
 	if !strings.Contains(err.Error(), "drop one of them") {
-		t.Errorf("InferSchema() error = %v, want it to say the two disagree", err)
+		t.Errorf("inferSchema() error = %v, want it to say the two disagree", err)
 	}
 }
 

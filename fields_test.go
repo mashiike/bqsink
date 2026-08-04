@@ -110,47 +110,47 @@ func TestEmbeddedFieldsArePromoted(t *testing.T) {
 	}{
 		{
 			name: "an embedded struct's columns are promoted",
-			fn:   InferSchema[promotingRow],
+			fn:   inferSchema[promotingRow],
 			want: []string{"id", "kind", "name"},
 		},
 		{
 			name: "an embedded type with no exported fields contributes nothing",
-			fn:   InferSchema[lockedRow],
+			fn:   inferSchema[lockedRow],
 			want: []string{"name"},
 		},
 		{
 			name: "a named embedded struct becomes one column",
-			fn:   InferSchema[namedEmbedRow],
+			fn:   inferSchema[namedEmbedRow],
 			want: []string{"base", "name"},
 		},
 		{
 			name: "an embedded struct can be dropped",
-			fn:   InferSchema[skippedEmbedRow],
+			fn:   inferSchema[skippedEmbedRow],
 			want: []string{"name"},
 		},
 		{
 			name: "the shallower field hides the promoted one of the same name",
-			fn:   InferSchema[shadowingRow],
+			fn:   inferSchema[shadowingRow],
 			want: []string{"kind", "id", "name"},
 		},
 		{
 			name: "a tie at the same depth removes that column only",
-			fn:   InferSchema[ambiguousRow],
+			fn:   inferSchema[ambiguousRow],
 			want: []string{"kind", "name"},
 		},
 		{
 			name: "an explicit tag settles a tie at the same depth",
-			fn:   InferSchema[taggedTieRow],
+			fn:   inferSchema[taggedTieRow],
 			want: []string{"Value", "name"},
 		},
 		{
 			name: "promotion works through two levels",
-			fn:   InferSchema[deepRow],
+			fn:   inferSchema[deepRow],
 			want: []string{"id", "kind", "middle", "name"},
 		},
 		{
 			name: "an embedded pointer is promoted too",
-			fn:   InferSchema[ptrEmbedRow],
+			fn:   inferSchema[ptrEmbedRow],
 			want: []string{"id", "kind", "name"},
 		},
 	}
@@ -160,7 +160,7 @@ func TestEmbeddedFieldsArePromoted(t *testing.T) {
 			t.Parallel()
 			schema, err := tt.fn()
 			if err != nil {
-				t.Fatalf("InferSchema() error = %v", err)
+				t.Fatalf("inferSchema() error = %v", err)
 			}
 			if got := columnNames(schema); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("columns = %v, want %v", got, tt.want)
@@ -172,9 +172,9 @@ func TestEmbeddedFieldsArePromoted(t *testing.T) {
 func TestNamedEmbeddedStructIsAJSONColumn(t *testing.T) {
 	t.Parallel()
 
-	schema, err := InferSchema[namedEmbedRow]()
+	schema, err := inferSchema[namedEmbedRow]()
 	if err != nil {
-		t.Fatalf("InferSchema() error = %v", err)
+		t.Fatalf("inferSchema() error = %v", err)
 	}
 	if schema[0].Type != bigquery.JSONFieldType {
 		t.Errorf("base type = %s, want JSON", schema[0].Type)

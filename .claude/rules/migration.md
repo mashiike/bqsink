@@ -106,7 +106,7 @@ gRPC: Unavailable, DeadlineExceeded, ResourceExhausted, Internal, Aborted
 
 ## スキーマを明示しても plan は必要
 
-行を書くには struct を歩く必要があるので、`InferSchema` が失敗する型は `BigQueryTableMetadata` でスキーマを書き切っても `New` が失敗する。**「スキーマを明示すればタグ推論を完全に回避できる」わけではない。**
+行を書くには struct を歩く必要があるので、`buildRowPlan` が失敗する型は `BigQueryTableMetadata` でスキーマを書き切っても `New` が失敗する。**「スキーマを明示すればタグ推論を完全に回避できる」わけではない。**
 
 スキーマを外から渡す `WithSchema` / `WithTableMetadata` は削除済み（下記「宣言は行の型に属する」）。
 

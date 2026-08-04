@@ -82,7 +82,7 @@ paths:
 - `FieldMarshaler` は**型が自分の代わりに**実装する。レシーバが値なので型情報が不要でメソッドは2つ
 - `Marshalers` は**定義を変えられない型のために外から**登録する。`MarshalFunc[T]` の型パラメータが型情報を持つので、公開メソッドを持たない
 
-`MarshalFunc` にポインタ型 `*T` を渡すと、`lookup` が `deref` するので永久に一致しない。だから `MarshalFunc` は `buildErr` に記録して `WithMarshalers` / `InferSchema` で報告する。**コンストラクタがエラーを返せないので遅延報告になっている。**
+`MarshalFunc` にポインタ型 `*T` を渡すと、`lookup` が `deref` するので永久に一致しない。だから `MarshalFunc` は `buildErr` に記録して `WithMarshalers` で報告する。**コンストラクタがエラーを返せないので遅延報告になっている。**
 
 ## 埋め込みは `encoding/json` の規則をそのまま実装している
 

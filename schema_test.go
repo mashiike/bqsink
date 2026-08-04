@@ -106,6 +106,17 @@ type noExportedRow struct {
 	hidden string
 }
 
+// inferSchema derives the schema a row type declares, the way New does before it
+// reconciles anything. The tests reach the derivation through this rather than
+// through New so that a schema can be checked without a client or a fake table.
+func inferSchema[T any](marshalers ...*Marshalers) (bigquery.Schema, error) {
+	plan, err := buildRowPlan(reflect.TypeFor[T](), joinMarshalers(marshalers))
+	if err != nil {
+		return nil, err
+	}
+	return plan.schema(), nil
+}
+
 func TestInferSchema(t *testing.T) {
 	t.Parallel()
 
@@ -121,7 +132,7 @@ func TestInferSchema(t *testing.T) {
 	}{
 		{
 			name: "untagged fields are NULLABLE and keep the Go field name",
-			fn:   InferSchema[simpleRow],
+			fn:   inferSchema[simpleRow],
 			want: bigquery.Schema{
 				{Name: "Name", Type: bigquery.StringFieldType},
 				{Name: "Count", Type: bigquery.IntegerFieldType},
@@ -129,7 +140,7 @@ func TestInferSchema(t *testing.T) {
 		},
 		{
 			name: "Go types map to BigQuery types",
-			fn:   InferSchema[allTypesRow],
+			fn:   inferSchema[allTypesRow],
 			want: bigquery.Schema{
 				{Name: "Str", Type: bigquery.StringFieldType},
 				{Name: "Bool", Type: bigquery.BooleanFieldType},
@@ -147,7 +158,7 @@ func TestInferSchema(t *testing.T) {
 		},
 		{
 			name: "tags rename, require and skip fields, and unexported fields drop out",
-			fn:   InferSchema[taggedRow],
+			fn:   inferSchema[taggedRow],
 			want: bigquery.Schema{
 				{Name: "user_id", Type: bigquery.StringFieldType, Required: true},
 				{Name: "optional", Type: bigquery.StringFieldType},
@@ -157,7 +168,7 @@ func TestInferSchema(t *testing.T) {
 		},
 		{
 			name: "slices and arrays are REPEATED, byte sequences are BYTES",
-			fn:   InferSchema[repeatedRow],
+			fn:   inferSchema[repeatedRow],
 			want: bigquery.Schema{
 				{Name: "Tags", Type: bigquery.StringFieldType, Repeated: true},
 				{Name: "Blobs", Type: bigquery.BytesFieldType, Repeated: true},
@@ -166,7 +177,7 @@ func TestInferSchema(t *testing.T) {
 		},
 		{
 			name: "uint and uint64 become NUMERIC, narrower unsigned types stay INTEGER",
-			fn:   InferSchema[unsignedRow],
+			fn:   inferSchema[unsignedRow],
 			want: bigquery.Schema{
 				{Name: "U8", Type: bigquery.IntegerFieldType},
 				{Name: "U16", Type: bigquery.IntegerFieldType},
@@ -178,7 +189,7 @@ func TestInferSchema(t *testing.T) {
 		},
 		{
 			name: "structures with no BigQuery column type of their own become JSON",
-			fn:   InferSchema[jsonRow],
+			fn:   inferSchema[jsonRow],
 			want: bigquery.Schema{
 				{Name: "Struct", Type: bigquery.JSONFieldType},
 				{Name: "Records", Type: bigquery.JSONFieldType, Repeated: true},
@@ -190,7 +201,7 @@ func TestInferSchema(t *testing.T) {
 		},
 		{
 			name: `the "record" option expands a struct into a RECORD instead`,
-			fn:   InferSchema[recordRow],
+			fn:   inferSchema[recordRow],
 			want: bigquery.Schema{
 				{Name: "inner", Type: bigquery.RecordFieldType, Schema: nested},
 				{Name: "inner_ptr", Type: bigquery.RecordFieldType, Schema: nested},
@@ -199,7 +210,7 @@ func TestInferSchema(t *testing.T) {
 		},
 		{
 			name: "pointers are followed to their element type",
-			fn:   InferSchema[pointerRow],
+			fn:   inferSchema[pointerRow],
 			want: bigquery.Schema{
 				{Name: "Str", Type: bigquery.StringFieldType},
 				{Name: "Num", Type: bigquery.IntegerFieldType},
@@ -209,7 +220,7 @@ func TestInferSchema(t *testing.T) {
 		},
 		{
 			name: "a pointer type parameter is followed to its struct",
-			fn:   InferSchema[*simpleRow],
+			fn:   inferSchema[*simpleRow],
 			want: bigquery.Schema{
 				{Name: "Name", Type: bigquery.StringFieldType},
 				{Name: "Count", Type: bigquery.IntegerFieldType},
@@ -222,10 +233,10 @@ func TestInferSchema(t *testing.T) {
 			t.Parallel()
 			got, err := tt.fn()
 			if err != nil {
-				t.Fatalf("InferSchema() error = %v", err)
+				t.Fatalf("inferSchema() error = %v", err)
 			}
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("InferSchema() mismatch\n got: %s\nwant: %s", formatSchema(got), formatSchema(tt.want))
+				t.Errorf("inferSchema() mismatch\n got: %s\nwant: %s", formatSchema(got), formatSchema(tt.want))
 			}
 		})
 	}
@@ -238,12 +249,12 @@ func TestInferSchemaError(t *testing.T) {
 		name string
 		fn   func(...*Marshalers) (bigquery.Schema, error)
 	}{
-		{name: "not a struct", fn: InferSchema[int]},
-		{name: "uintptr, which is not data", fn: InferSchema[unsupportedRow]},
-		{name: "a map with non-string keys", fn: InferSchema[badMapKeyRow]},
-		{name: `the "record" option on a non-struct`, fn: InferSchema[recordOnANonStructRow]},
-		{name: "an unknown tag option", fn: InferSchema[unknownOptionRow]},
-		{name: "no exported fields", fn: InferSchema[noExportedRow]},
+		{name: "not a struct", fn: inferSchema[int]},
+		{name: "uintptr, which is not data", fn: inferSchema[unsupportedRow]},
+		{name: "a map with non-string keys", fn: inferSchema[badMapKeyRow]},
+		{name: `the "record" option on a non-struct`, fn: inferSchema[recordOnANonStructRow]},
+		{name: "an unknown tag option", fn: inferSchema[unknownOptionRow]},
+		{name: "no exported fields", fn: inferSchema[noExportedRow]},
 	}
 
 	for _, tt := range tests {
@@ -251,7 +262,7 @@ func TestInferSchemaError(t *testing.T) {
 			t.Parallel()
 			got, err := tt.fn()
 			if err == nil {
-				t.Fatalf("InferSchema() error = nil, want an error (schema %s)", formatSchema(got))
+				t.Fatalf("inferSchema() error = nil, want an error (schema %s)", formatSchema(got))
 			}
 		})
 	}

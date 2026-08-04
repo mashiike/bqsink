@@ -57,9 +57,9 @@ func (r *failingFillRow) FillRow(_ context.Context, info AppendInfo) error {
 func TestIngestionMetadataColumns(t *testing.T) {
 	t.Parallel()
 
-	schema, err := InferSchema[metadataRow]()
+	schema, err := inferSchema[metadataRow]()
 	if err != nil {
-		t.Fatalf("InferSchema() error = %v", err)
+		t.Fatalf("inferSchema() error = %v", err)
 	}
 	want := bigquery.Schema{
 		{Name: "_ingestion_at", Type: bigquery.TimestampFieldType},
