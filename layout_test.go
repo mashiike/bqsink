@@ -358,9 +358,9 @@ func TestLayoutIsValidated(t *testing.T) {
 func TestNewAppliesTheTaggedLayout(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[layoutRow](testClient(t), testRelation())
+	s, err := testSinker[layoutRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
 	if s.metadata == nil {
 		t.Fatal("metadata = nil, want the layout from the tags")
@@ -441,12 +441,12 @@ type clusteredConflictRow struct {
 func TestNewRejectsATypeContradictingItself(t *testing.T) {
 	t.Parallel()
 
-	_, err := New[metadataConflictRow](testClient(t), testRelation())
+	_, err := testSinker[metadataConflictRow](t)
 	if err == nil {
-		t.Fatal("New() error = nil, want the contradiction between the tag and the method to be rejected")
+		t.Fatal("testSinker() error = nil, want the contradiction between the tag and the method to be rejected")
 	}
 	if !strings.Contains(err.Error(), "drop one of them") {
-		t.Errorf("New() error = %v, want it to say the two disagree", err)
+		t.Errorf("testSinker() error = %v, want it to say the two disagree", err)
 	}
 }
 
@@ -460,9 +460,9 @@ type tableMetaRow struct {
 func TestTableMetaDescribesTheTable(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[tableMetaRow](testClient(t), testRelation())
+	s, err := testSinker[tableMetaRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
 	if s.metadata == nil {
 		t.Fatal("metadata = nil, want the one the embedded TableMeta describes")
@@ -479,13 +479,13 @@ func TestTableMetaDescribesTheTable(t *testing.T) {
 func TestTableMetaContributesNoColumn(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[tableMetaRow](testClient(t), testRelation())
+	s, err := testSinker[tableMetaRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
 	want := bigquery.Schema{{Name: "user_id", Type: bigquery.StringFieldType}}
-	if got := s.Schema(); !reflect.DeepEqual(got, want) {
-		t.Errorf("Schema() = %s, want %s", formatSchema(got), formatSchema(want))
+	if got := s.schema; !reflect.DeepEqual(got, want) {
+		t.Errorf("schema = %s, want %s", formatSchema(got), formatSchema(want))
 	}
 }
 
@@ -517,19 +517,19 @@ func TestTableMetaContradictingTheMethodIsRejected(t *testing.T) {
 
 	tests := []struct {
 		name string
-		fn   func(*bigquery.Client) error
+		fn   func(*testing.T) error
 	}{
 		{
 			name: "a description set both ways",
-			fn: func(c *bigquery.Client) error {
-				_, err := New[tableMetaConflictRow](c, testRelation())
+			fn: func(t *testing.T) error {
+				_, err := testSinker[tableMetaConflictRow](t)
 				return err
 			},
 		},
 		{
 			name: "labels set both ways",
-			fn: func(c *bigquery.Client) error {
-				_, err := New[labelConflictRow](c, testRelation())
+			fn: func(t *testing.T) error {
+				_, err := testSinker[labelConflictRow](t)
 				return err
 			},
 		},
@@ -538,12 +538,12 @@ func TestTableMetaContradictingTheMethodIsRejected(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			err := tt.fn(testClient(t))
+			err := tt.fn(t)
 			if err == nil {
-				t.Fatal("New() error = nil, want the contradiction to be rejected")
+				t.Fatal("testSinker() error = nil, want the contradiction to be rejected")
 			}
 			if !strings.Contains(err.Error(), "drop one of them") {
-				t.Errorf("New() error = %v, want it to say the two disagree", err)
+				t.Errorf("testSinker() error = %v, want it to say the two disagree", err)
 			}
 		})
 	}
@@ -624,9 +624,9 @@ type tableMetaCarrier struct {
 func TestTableMetaIsOnlyReadFromADirectField(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[nestedTableMetaRow](testClient(t), testRelation())
+	s, err := testSinker[nestedTableMetaRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
 	if s.metadata != nil {
 		t.Errorf("metadata = %+v, want nil for a TableMeta reached through an embedded struct", s.metadata)

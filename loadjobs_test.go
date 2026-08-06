@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"reflect"
 	"strings"
@@ -30,7 +31,7 @@ type fakeLoader struct {
 	errs  []error
 }
 
-func (l *fakeLoader) load(ctx context.Context, rows []byte, schema bigquery.Schema) error {
+func (l *fakeLoader) load(ctx context.Context, rows []byte, schema bigquery.Schema, logger *slog.Logger) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	i := len(l.calls)
@@ -68,19 +69,23 @@ func TestLoadJobsWriteRowsSubmitsOneJob(t *testing.T) {
 	t.Parallel()
 
 	loader := &fakeLoader{}
-	w := &loadJobsWriter{loader: loader, schema: abSchema(), logger: discardLogger()}
+	w := &LoadJobsWriter{loader: loader, schema: abSchema(), logger: discardLogger()}
 
 	rows := []Row{
 		rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(0)}),
 		rowOf("r2", map[string]bigquery.Value{"A": "x", "B": int64(1)}),
 		rowOf("r3", map[string]bigquery.Value{"A": "x", "B": int64(2)}),
 	}
-	n, err := w.WriteRows(t.Context(), rows)
+	res, err := w.WriteRows(t.Context(), rows)
 	if err != nil {
 		t.Fatalf("WriteRows() error = %v", err)
 	}
+	n, err := res.Wait(t.Context())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
 	if n != len(rows) {
-		t.Errorf("WriteRows() n = %d, want %d", n, len(rows))
+		t.Errorf("Wait() n = %d, want %d", n, len(rows))
 	}
 	calls := loader.snapshot()
 	if len(calls) != 1 {
@@ -99,14 +104,18 @@ func TestLoadJobsWriteRowsWithNoRowsDoesNothing(t *testing.T) {
 	t.Parallel()
 
 	loader := &fakeLoader{}
-	w := &loadJobsWriter{loader: loader, schema: abSchema(), logger: discardLogger()}
+	w := &LoadJobsWriter{loader: loader, schema: abSchema(), logger: discardLogger()}
 
-	n, err := w.WriteRows(t.Context(), nil)
+	res, err := w.WriteRows(t.Context(), nil)
 	if err != nil {
 		t.Fatalf("WriteRows() error = %v", err)
 	}
+	n, err := res.Wait(t.Context())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
 	if n != 0 {
-		t.Errorf("WriteRows() n = %d, want 0", n)
+		t.Errorf("Wait() n = %d, want 0", n)
 	}
 	if calls := loader.snapshot(); len(calls) != 0 {
 		t.Errorf("load was called %d times with nothing to write, want 0", len(calls))
@@ -122,19 +131,23 @@ func TestLoadJobsWriteRowsRetriesAndResendsEveryRow(t *testing.T) {
 	t.Parallel()
 
 	loader := &fakeLoader{errs: []error{unavailableErr(), nil}}
-	w := &loadJobsWriter{loader: loader, schema: abSchema(), retryPolicy: fastRetryPolicy, logger: discardLogger()}
+	w := &LoadJobsWriter{loader: loader, schema: abSchema(), retryPolicy: fastRetryPolicy, logger: discardLogger()}
 
 	rows := []Row{
 		rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(0)}),
 		rowOf("r2", map[string]bigquery.Value{"A": "y", "B": int64(1)}),
 		rowOf("r3", map[string]bigquery.Value{"A": "z", "B": int64(2)}),
 	}
-	n, err := w.WriteRows(t.Context(), rows)
+	res, err := w.WriteRows(t.Context(), rows)
 	if err != nil {
-		t.Fatalf("WriteRows() error = %v, want the retry to get through", err)
+		t.Fatalf("WriteRows() error = %v", err)
+	}
+	n, err := res.Wait(t.Context())
+	if err != nil {
+		t.Fatalf("Wait() error = %v, want the retry to get through", err)
 	}
 	if n != len(rows) {
-		t.Errorf("WriteRows() n = %d, want %d", n, len(rows))
+		t.Errorf("Wait() n = %d, want %d", n, len(rows))
 	}
 	calls := loader.snapshot()
 	if len(calls) != 2 {
@@ -154,14 +167,18 @@ func TestLoadJobsWriteRowsGivesUpAfterExhaustingRetries(t *testing.T) {
 
 	sentinel := errors.New("load refused")
 	loader := &fakeLoader{errs: []error{sentinel}}
-	w := &loadJobsWriter{loader: loader, retryPolicy: noRetryPolicy, schema: abSchema(), logger: discardLogger()}
+	w := &LoadJobsWriter{loader: loader, retryPolicy: noRetryPolicy, schema: abSchema(), logger: discardLogger()}
 
-	n, err := w.WriteRows(t.Context(), []Row{rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(1)})})
+	res, err := w.WriteRows(t.Context(), []Row{rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(1)})})
+	if err != nil {
+		t.Fatalf("WriteRows() error = %v", err)
+	}
+	n, err := res.Wait(t.Context())
 	if !errors.Is(err, sentinel) {
-		t.Fatalf("WriteRows() error = %v, want the load failure", err)
+		t.Fatalf("Wait() error = %v, want the load failure", err)
 	}
 	if n != 0 {
-		t.Errorf("WriteRows() n = %d, want 0", n)
+		t.Errorf("Wait() n = %d, want 0", n)
 	}
 	if calls := loader.snapshot(); len(calls) != 1 {
 		t.Errorf("load was called %d times, want 1; a policy that retries nothing must not retry", len(calls))
@@ -185,9 +202,13 @@ func TestLoadJobsWriteRowsRetryPolicyControlsWhetherItRetries(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			loader := &fakeLoader{errs: []error{unavailableErr(), nil}}
-			w := &loadJobsWriter{loader: loader, retryPolicy: tt.retryPolicy, schema: abSchema(), logger: discardLogger()}
+			w := &LoadJobsWriter{loader: loader, retryPolicy: tt.retryPolicy, schema: abSchema(), logger: discardLogger()}
 
-			_, _ = w.WriteRows(t.Context(), []Row{rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(1)})})
+			res, err := w.WriteRows(t.Context(), []Row{rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(1)})})
+			if err != nil {
+				t.Fatalf("WriteRows() error = %v", err)
+			}
+			_, _ = res.Wait(t.Context())
 			if calls := loader.snapshot(); len(calls) != tt.wantCalls {
 				t.Errorf("load was called %d times, want %d", len(calls), tt.wantCalls)
 			}
@@ -195,20 +216,331 @@ func TestLoadJobsWriteRowsRetryPolicyControlsWhetherItRetries(t *testing.T) {
 	}
 }
 
+// TestLoadJobsFlushRowsGroupsMultipleWriteRows checks that rows from separate
+// WriteRows calls share one load job once FlushRows has gathered enough of
+// them, and that each WriteResult still reports only the rows its own call
+// contributed.
+func TestLoadJobsFlushRowsGroupsMultipleWriteRows(t *testing.T) {
+	t.Parallel()
+
+	loader := &fakeLoader{}
+	w := &LoadJobsWriter{loader: loader, schema: abSchema(), logger: discardLogger(), flushRows: 4}
+
+	first := []Row{
+		rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(0)}),
+		rowOf("r2", map[string]bigquery.Value{"A": "x", "B": int64(1)}),
+	}
+	second := []Row{
+		rowOf("r3", map[string]bigquery.Value{"A": "x", "B": int64(2)}),
+		rowOf("r4", map[string]bigquery.Value{"A": "x", "B": int64(3)}),
+	}
+	res1, err := w.WriteRows(t.Context(), first)
+	if err != nil {
+		t.Fatalf("WriteRows() (first) error = %v", err)
+	}
+	res2, err := w.WriteRows(t.Context(), second)
+	if err != nil {
+		t.Fatalf("WriteRows() (second) error = %v", err)
+	}
+	n1, err := res1.Wait(t.Context())
+	if err != nil {
+		t.Fatalf("Wait() (first) error = %v", err)
+	}
+	if n1 != len(first) {
+		t.Errorf("Wait() (first) n = %d, want %d", n1, len(first))
+	}
+	n2, err := res2.Wait(t.Context())
+	if err != nil {
+		t.Fatalf("Wait() (second) error = %v", err)
+	}
+	if n2 != len(second) {
+		t.Errorf("Wait() (second) n = %d, want %d", n2, len(second))
+	}
+	calls := loader.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("load was called %d times, want 1", len(calls))
+	}
+	lines := strings.Split(strings.TrimSuffix(calls[0].rows, "\n"), "\n")
+	if len(lines) != 4 {
+		t.Errorf("the load job carried %d lines, want 4", len(lines))
+	}
+}
+
+// TestLoadJobsWaitBeforeFlushRowsSubmitsAtOnce checks that waiting on a
+// WriteResult before FlushRows has gathered enough rows submits the batch
+// right away, which is what makes waiting at once equivalent to writing
+// without a buffer at all.
+func TestLoadJobsWaitBeforeFlushRowsSubmitsAtOnce(t *testing.T) {
+	t.Parallel()
+
+	loader := &fakeLoader{}
+	w := &LoadJobsWriter{loader: loader, schema: abSchema(), logger: discardLogger(), flushRows: 100}
+
+	rows := []Row{
+		rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(0)}),
+		rowOf("r2", map[string]bigquery.Value{"A": "x", "B": int64(1)}),
+	}
+	res, err := w.WriteRows(t.Context(), rows)
+	if err != nil {
+		t.Fatalf("WriteRows() error = %v", err)
+	}
+	if calls := loader.snapshot(); len(calls) != 0 {
+		t.Fatalf("load was called %d times before Wait, want 0", len(calls))
+	}
+	n, err := res.Wait(t.Context())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if n != len(rows) {
+		t.Errorf("Wait() n = %d, want %d", n, len(rows))
+	}
+	calls := loader.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("load was called %d times, want 1", len(calls))
+	}
+	lines := strings.Split(strings.TrimSuffix(calls[0].rows, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Errorf("the load job carried %d lines, want 2", len(lines))
+	}
+}
+
+// TestLoadJobsFlushSubmitsPendingRows checks that Flush sends what FlushRows is
+// still holding back, and that waiting afterwards on the WriteResult from
+// before the Flush does not submit the same batch a second time.
+func TestLoadJobsFlushSubmitsPendingRows(t *testing.T) {
+	t.Parallel()
+
+	loader := &fakeLoader{}
+	w := &LoadJobsWriter{loader: loader, schema: abSchema(), logger: discardLogger(), flushRows: 100}
+
+	rows := []Row{
+		rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(0)}),
+		rowOf("r2", map[string]bigquery.Value{"A": "x", "B": int64(1)}),
+	}
+	res, err := w.WriteRows(t.Context(), rows)
+	if err != nil {
+		t.Fatalf("WriteRows() error = %v", err)
+	}
+	if err := w.Flush(t.Context()); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+	if calls := loader.snapshot(); len(calls) != 1 {
+		t.Fatalf("load was called %d times after Flush, want 1", len(calls))
+	}
+	n, err := res.Wait(t.Context())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if n != len(rows) {
+		t.Errorf("Wait() n = %d, want %d", n, len(rows))
+	}
+	calls := loader.snapshot()
+	if len(calls) != 1 {
+		t.Errorf("load was called %d times after Wait, want still 1 (the same batch, not sent twice)", len(calls))
+	}
+	lines := strings.Split(strings.TrimSuffix(calls[0].rows, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Errorf("the load job carried %d lines, want 2", len(lines))
+	}
+}
+
+// TestLoadJobsCloseSubmitsPendingRows checks that Close sends what FlushRows is
+// still holding back, and that a WriteRows call after Close is rejected.
+func TestLoadJobsCloseSubmitsPendingRows(t *testing.T) {
+	t.Parallel()
+
+	loader := &fakeLoader{}
+	w := &LoadJobsWriter{loader: loader, schema: abSchema(), logger: discardLogger(), flushRows: 100}
+
+	rows := []Row{
+		rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(0)}),
+		rowOf("r2", map[string]bigquery.Value{"A": "x", "B": int64(1)}),
+	}
+	if _, err := w.WriteRows(t.Context(), rows); err != nil {
+		t.Fatalf("WriteRows() error = %v", err)
+	}
+	if err := w.Close(t.Context()); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	calls := loader.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("load was called %d times, want 1", len(calls))
+	}
+	lines := strings.Split(strings.TrimSuffix(calls[0].rows, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Errorf("the load job carried %d lines, want 2", len(lines))
+	}
+	if _, err := w.WriteRows(t.Context(), rows); err == nil {
+		t.Error("WriteRows() after Close error = nil, want a rejection")
+	}
+}
+
+// TestLoadJobsBatchFailureReachesEveryWriteResultSharingIt checks that when a
+// batch's load job fails, every WriteResult of a WriteRows call that
+// contributed rows to it reports the same failure and no rows landed.
+func TestLoadJobsBatchFailureReachesEveryWriteResultSharingIt(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("load refused")
+	loader := &fakeLoader{errs: []error{sentinel}}
+	w := &LoadJobsWriter{loader: loader, schema: abSchema(), retryPolicy: noRetryPolicy, logger: discardLogger(), flushRows: 4}
+
+	first := []Row{
+		rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(0)}),
+		rowOf("r2", map[string]bigquery.Value{"A": "x", "B": int64(1)}),
+	}
+	second := []Row{
+		rowOf("r3", map[string]bigquery.Value{"A": "x", "B": int64(2)}),
+		rowOf("r4", map[string]bigquery.Value{"A": "x", "B": int64(3)}),
+	}
+	res1, err := w.WriteRows(t.Context(), first)
+	if err != nil {
+		t.Fatalf("WriteRows() (first) error = %v", err)
+	}
+	res2, err := w.WriteRows(t.Context(), second)
+	if err != nil {
+		t.Fatalf("WriteRows() (second) error = %v", err)
+	}
+	n1, err1 := res1.Wait(t.Context())
+	if !errors.Is(err1, sentinel) {
+		t.Errorf("Wait() (first) error = %v, want %v", err1, sentinel)
+	}
+	if n1 != 0 {
+		t.Errorf("Wait() (first) n = %d, want 0", n1)
+	}
+	n2, err2 := res2.Wait(t.Context())
+	if !errors.Is(err2, sentinel) {
+		t.Errorf("Wait() (second) error = %v, want %v", err2, sentinel)
+	}
+	if n2 != 0 {
+		t.Errorf("Wait() (second) n = %d, want 0", n2)
+	}
+}
+
+// TestLoadJobsCloseReportsAFailureNobodyWaitedFor checks that a batch which
+// fails without any caller ever waiting on its WriteResult is not lost: Close
+// reports it, naming how many rows did not land. This is the core guarantee
+// that rows are never dropped silently.
+func TestLoadJobsCloseReportsAFailureNobodyWaitedFor(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("load refused")
+	loader := &fakeLoader{errs: []error{sentinel}}
+	w := &LoadJobsWriter{loader: loader, schema: abSchema(), retryPolicy: noRetryPolicy, logger: discardLogger(), flushRows: 2}
+
+	rows := []Row{
+		rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(0)}),
+		rowOf("r2", map[string]bigquery.Value{"A": "x", "B": int64(1)}),
+	}
+	if _, err := w.WriteRows(t.Context(), rows); err != nil {
+		t.Fatalf("WriteRows() error = %v", err)
+	}
+	err := w.Close(t.Context())
+	if err == nil {
+		t.Fatal("Close() error = nil, want the failure nobody waited for")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("Close() error = %v, want it to wrap %v", err, sentinel)
+	}
+	if !strings.Contains(err.Error(), "2 row") {
+		t.Errorf("Close() error = %q, want it to name the 2 rows that did not land", err.Error())
+	}
+}
+
+// TestLoadJobsConcurrentWriteRowsShareBatchesSafely checks, under -race, that
+// concurrent WriteRows calls claim and settle a shared batch correctly: every
+// call gets back exactly the rows it sent, and the rows of every call land in
+// some load job even though several goroutines are filling batches at once.
+//
+// None of the writing goroutines waits on its WriteResult, so a batch can only
+// close by reaching FlushRows; that is what makes the count of load jobs below
+// exact instead of depending on how the goroutines happen to interleave.
+func TestLoadJobsConcurrentWriteRowsShareBatchesSafely(t *testing.T) {
+	t.Parallel()
+
+	loader := &fakeLoader{}
+	w := &LoadJobsWriter{loader: loader, schema: abSchema(), logger: discardLogger(), flushRows: 2}
+
+	const calls = 50
+	results := make([]WriteResult, calls)
+	writeErrs := make([]error, calls)
+
+	var wg sync.WaitGroup
+	for i := range calls {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], writeErrs[i] = w.WriteRows(t.Context(), []Row{
+				rowOf(fmt.Sprintf("r%d", i), map[string]bigquery.Value{"A": "x", "B": int64(i)}),
+			})
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range writeErrs {
+		if err != nil {
+			t.Fatalf("WriteRows() (call %d) error = %v", i, err)
+		}
+	}
+
+	jobs := loader.snapshot()
+	if len(jobs) != calls/2 {
+		t.Fatalf("load was called %d times, want %d (batches of 2)", len(jobs), calls/2)
+	}
+	rowsSeen := 0
+	for _, c := range jobs {
+		rowsSeen += len(strings.Split(strings.TrimSuffix(c.rows, "\n"), "\n"))
+	}
+	if rowsSeen != calls {
+		t.Errorf("the load jobs carried %d rows in total, want %d", rowsSeen, calls)
+	}
+
+	ns := make([]int, calls)
+	waitErrs := make([]error, calls)
+	for i := range calls {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ns[i], waitErrs[i] = results[i].Wait(t.Context())
+		}(i)
+	}
+	wg.Wait()
+
+	total := 0
+	for i := range calls {
+		if waitErrs[i] != nil {
+			t.Fatalf("Wait() (call %d) error = %v", i, waitErrs[i])
+		}
+		if ns[i] != 1 {
+			t.Errorf("Wait() (call %d) n = %d, want 1", i, ns[i])
+		}
+		total += ns[i]
+	}
+	if total != calls {
+		t.Errorf("total rows landed = %d, want %d", total, calls)
+	}
+	if got := len(loader.snapshot()); got != calls/2 {
+		t.Errorf("load was called %d times after Wait, want still %d (no batch sent twice)", got, calls/2)
+	}
+}
+
 func TestLoadJobsWriteRowsRejectsARowTheSchemaDoesNotCover(t *testing.T) {
 	t.Parallel()
 
 	loader := &fakeLoader{}
-	w := &loadJobsWriter{loader: loader, schema: abSchema(), logger: discardLogger()}
+	w := &LoadJobsWriter{loader: loader, schema: abSchema(), logger: discardLogger()}
 
-	n, err := w.WriteRows(t.Context(), []Row{
+	res, err := w.WriteRows(t.Context(), []Row{
 		rowOf("r1", map[string]bigquery.Value{"A": "x", "B": int64(1), "C": "extra"}),
 	})
+	if err != nil {
+		t.Fatalf("WriteRows() error = %v", err)
+	}
+	n, err := res.Wait(t.Context())
 	if err == nil {
-		t.Fatal("WriteRows() error = nil, want a rejection of the unknown column")
+		t.Fatal("Wait() error = nil, want a rejection of the unknown column")
 	}
 	if n != 0 {
-		t.Errorf("WriteRows() n = %d, want 0", n)
+		t.Errorf("Wait() n = %d, want 0", n)
 	}
 	if calls := loader.snapshot(); len(calls) != 0 {
 		t.Errorf("load was called %d times, want 0", len(calls))
@@ -427,17 +759,12 @@ func TestLoadJobsStagesThroughAStager(t *testing.T) {
 	t.Parallel()
 
 	stager := &fakeStager{}
-	table := &bigquery.Table{ProjectID: "p", DatasetID: "d", TableID: "t"}
-	w, err := (&LoadJobs{Staging: stager}).Open(t.Context(), table, abSchema(), discardLogger())
+	w, err := (&LoadJobs{Staging: stager}).NewWriter(testClient(t), testRelation())
 	if err != nil {
-		t.Fatalf("Open() error = %v", err)
+		t.Fatalf("NewWriter() error = %v", err)
 	}
-	writer, ok := w.(*loadJobsWriter)
-	if !ok {
-		t.Fatalf("Open() returned %T, want a *loadJobsWriter", w)
-	}
-	if _, ok := writer.loader.(stagedLoader); !ok {
-		t.Errorf("loader = %T, want a stagedLoader once Staging is set", writer.loader)
+	if _, ok := w.loader.(stagedLoader); !ok {
+		t.Errorf("loader = %T, want a stagedLoader once Staging is set", w.loader)
 	}
 }
 
@@ -445,7 +772,117 @@ func TestLoadJobsRejectsAnInvalidStager(t *testing.T) {
 	t.Parallel()
 
 	stager := &fakeStager{validate: errors.New("no bucket")}
-	if _, err := New[nestedRow](testClient(t), testRelation(), WithWriteStrategy(&LoadJobs{Staging: stager})); err == nil {
-		t.Fatal("New() error = nil, want the stager's own rejection")
+	if _, err := (&LoadJobs{Staging: stager}).NewWriter(testClient(t), testRelation()); err == nil {
+		t.Fatal("NewWriter() error = nil, want the stager's own rejection")
 	}
+}
+
+// TestLoadJobsBindSchemaGuards covers what BindSchema turns down. Nothing can be
+// written before a schema arrives, and a second one would leave the rows already
+// written described by something else.
+func TestLoadJobsBindSchemaGuards(t *testing.T) {
+	t.Parallel()
+
+	w := &LoadJobsWriter{loader: &fakeLoader{}, logger: slog.New(slog.DiscardHandler)}
+	if err := w.BindSchema(t.Context(), nil); err == nil {
+		t.Error("BindSchema(nil) error = nil, want an empty schema to be refused")
+	}
+	if err := w.BindSchema(t.Context(), abSchema()); err != nil {
+		t.Fatalf("BindSchema() error = %v", err)
+	}
+	if err := w.BindSchema(t.Context(), abSchema()); err == nil {
+		t.Error("BindSchema() error = nil on the second call, want a second schema to be refused")
+	}
+}
+
+// TestLoadJobsWriteRowsBeforeBindSchema checks that rows are turned down rather
+// than written against a schema the writer does not have yet.
+func TestLoadJobsWriteRowsBeforeBindSchema(t *testing.T) {
+	t.Parallel()
+
+	w := &LoadJobsWriter{loader: &fakeLoader{}, logger: slog.New(slog.DiscardHandler)}
+	if _, err := w.WriteRows(t.Context(), []Row{{ID: "1", Values: map[string]bigquery.Value{"A": "a"}}}); err == nil {
+		t.Error("WriteRows() error = nil before BindSchema, want the rows to be refused")
+	}
+}
+
+// TestLoadJobsCloseReportsAFailureOnlySomeCallersWaitedFor checks that one caller
+// asking what became of a batch does not answer for another. Three calls share the
+// batch, one waits, and Close still owes the other two an answer.
+func TestLoadJobsCloseReportsAFailureOnlySomeCallersWaitedFor(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("the load job failed")
+	loader := &fakeLoader{errs: []error{sentinel}}
+	w := &LoadJobsWriter{
+		loader:    loader,
+		schema:    abSchema(),
+		flushRows: 3,
+		logger:    slog.New(slog.DiscardHandler),
+	}
+	ctx := t.Context()
+	var results []WriteResult
+	for i := range 3 {
+		res, err := w.WriteRows(ctx, []Row{{ID: string(rune('a' + i)), Values: map[string]bigquery.Value{"A": "a", "B": int64(i)}}})
+		if err != nil {
+			t.Fatalf("WriteRows() error = %v", err)
+		}
+		results = append(results, res)
+	}
+	if _, err := results[0].Wait(ctx); !errors.Is(err, sentinel) {
+		t.Fatalf("Wait() error = %v, want the load failure", err)
+	}
+	err := w.Close(ctx)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Close() error = %v, want the failure the other two callers were never told", err)
+	}
+}
+
+// TestLoadJobsCloseWaitsForAJobAnotherCallerStarted checks that closing while a
+// job is still running does not return before its outcome is known: a failure
+// recorded after Close had already looked would reach nobody.
+func TestLoadJobsCloseWaitsForAJobAnotherCallerStarted(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("the load job failed")
+	release := make(chan struct{})
+	loader := &blockingLoader{release: release, err: sentinel}
+	w := &LoadJobsWriter{
+		loader:    loader,
+		schema:    abSchema(),
+		flushRows: 1,
+		logger:    slog.New(slog.DiscardHandler),
+	}
+	ctx := t.Context()
+	go func() {
+		if _, err := w.WriteRows(ctx, []Row{{ID: "1", Values: map[string]bigquery.Value{"A": "a", "B": int64(1)}}}); err != nil {
+			t.Errorf("WriteRows() error = %v", err)
+		}
+	}()
+	<-loader.entered()
+	close(release)
+	if err := w.Close(ctx); !errors.Is(err, sentinel) {
+		t.Fatalf("Close() error = %v, want the failure of the job it had to wait for", err)
+	}
+}
+
+// blockingLoader holds a load until it is released, so that a test can close a
+// writer while a job is in flight.
+type blockingLoader struct {
+	release chan struct{}
+	err     error
+
+	once sync.Once
+	in   chan struct{}
+}
+
+func (l *blockingLoader) entered() chan struct{} {
+	l.once.Do(func() { l.in = make(chan struct{}) })
+	return l.in
+}
+
+func (l *blockingLoader) load(context.Context, []byte, bigquery.Schema, *slog.Logger) error {
+	close(l.entered())
+	<-l.release
+	return l.err
 }

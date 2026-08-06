@@ -6,12 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/bigquery"
-	"cloud.google.com/go/bigquery/storage/managedwriter"
 	gax "github.com/googleapis/gax-go/v2"
-	"google.golang.org/api/option"
 )
 
 // Row is one row on its way to BigQuery.
@@ -20,107 +20,95 @@ type Row struct {
 	// something to say about it, and it is the value the _ingestion_row_id column
 	// gets when the row type fills that column in.
 	//
-	// It plays no part in reporting what could not be written: the count WriteRows
-	// returns is what says that.
+	// It plays no part in reporting what could not be written: the count a
+	// WriteResult returns is what says that.
 	ID string
 
 	// Values are the columns to write.
 	Values map[string]bigquery.Value
 }
 
-// RowWriter sends rows to BigQuery. Retrying a transient failure is its
-// responsibility, since it is the one holding the rows while they are in flight.
+// RowsWriter sends rows to a single BigQuery table.
 //
-// An implementation must be safe for concurrent use, because a Sinker is and
-// hands its writer straight to the caller's goroutines.
-type RowWriter interface {
-	// WriteRows writes rows in order and returns how many of them it wrote.
+// A writer holds everything writing depends on: the table it writes to, the
+// connection it goes through, how a transient failure is retried, and the rows a
+// buffering transport has not sent yet. A Sinker holds what none of that changes —
+// the declaration, reconciling the table with it, and turning rows into columns —
+// so that the two are settled apart from one another.
+//
+// An implementation must be safe for concurrent use.
+type RowsWriter interface {
+	// Relation names the table this writer writes to.
 	//
-	// It must return a non-nil error when n < len(rows), so that rows[n:] are
-	// exactly the rows that did not land. It must not retain rows after returning.
-	WriteRows(ctx context.Context, rows []Row) (n int, err error)
+	// It is the writer's own answer rather than something it repeats back, so a
+	// writer bound to a stream that already exists reports the table that stream
+	// belongs to.
+	Relation() Relation
 
-	// Close releases what the writer holds.
+	// Client returns the BigQuery client to reconcile the table through, or nil
+	// when the writer is not connected to BigQuery at all.
+	//
+	// A nil client leaves the real table unreadable, so NewSinker refuses every
+	// migration strategy but MigrationNone.
+	Client() *bigquery.Client
+
+	// BindSchema hands over the declared schema, once it has been reconciled with
+	// the real table and before the first WriteRows. It is called once.
+	//
+	// A transport that derives something from the schema, such as a proto
+	// descriptor, does it here and keeps it for the writer's lifetime.
+	BindSchema(ctx context.Context, schema bigquery.Schema) error
+
+	// WriteRows hands rows over and returns what will say whether they landed.
+	//
+	// A non-nil error means the rows were not taken at all. Otherwise they are the
+	// writer's until the WriteResult settles, and a writer that buffers may keep
+	// them past this call.
+	WriteRows(ctx context.Context, rows []Row) (WriteResult, error)
+
+	// Close releases what the writer holds, having settled the rows it still has.
+	// Rows a WriteResult was promised for but which were never sent are sent here,
+	// so closing is the last chance to decide their fate.
 	Close(ctx context.Context) error
 }
 
-// WriteStrategy decides how rows reach BigQuery.
-type WriteStrategy interface {
-	// Open returns a RowWriter for table. Migrate has already reconciled the
-	// schema by this point, so an implementation may derive a descriptor from it
-	// once and keep it for the writer's lifetime.
+// WriteResult says whether the rows of one WriteRows reached BigQuery.
+type WriteResult interface {
+	// Wait returns how many of that call's rows landed, and a non-nil error
+	// whenever that is fewer than the call was given, so that rows[n:] of it are
+	// exactly the rows that did not land.
 	//
-	// logger is the one WithLogger settled on, already carrying the relation, and
-	// it is never nil. A writer is expected to keep it and describe what it does
-	// with it, since an error it returns is the caller's to report and a failure
-	// it has to swallow would otherwise leave no trace.
-	Open(ctx context.Context, table *bigquery.Table, schema bigquery.Schema, logger *slog.Logger) (RowWriter, error)
+	// Waiting is also what sends rows a buffering transport still holds, which is
+	// the choice it offers: wait at once to know they landed, or wait later to let
+	// more rows share one job.
+	//
+	// Cancelling ctx does not take the rows back, and where the transport gathers
+	// rows from several calls it does not stop the job either: whichever call sends
+	// a batch lends the job its own ctx, so cancelling that one fails the batch for
+	// everyone whose rows are in it. A caller that cannot afford that gives every
+	// Sink the same ctx, or writes without FlushRows so that no batch is shared.
+	Wait(ctx context.Context) (n int, err error)
 }
 
-// StorageWrite writes rows through the BigQuery Storage Write API.
-//
-// Each WriteRows sends the rows as one append and waits for BigQuery to accept
-// them, so throughput comes from how many rows a single Sink is given rather than
-// from overlapping appends. An append is all or nothing: BigQuery appends none of
-// the rows in a request it rejects.
-//
-// BigQuery caps how large an append request may be, and StorageWrite does not split
-// one, so a batch past that cap is rejected rather than divided. Where batches are
-// large enough for that to be a worry, LoadJobs is the transport for them.
-//
-// Retrying is left to the client library's own automatic retries, which suit
-// at-least-once delivery. The number of attempts is therefore the library's to
-// decide, so StorageWrite has no policy to set the way LoadJobs does; what it has
-// is DisableWriteRetries, for turning them off.
-type StorageWrite struct {
-	// StreamType selects the kind of stream to create. The zero value means
-	// managedwriter.DefaultStream, which appends immediately and at least once.
-	//
-	// Only DefaultStream and CommittedStream are supported. PendingStream needs
-	// its rows committed in a batch and BufferedStream needs its offset flushed,
-	// neither of which bqsink does, so rows written to them would never become
-	// visible.
-	StreamType managedwriter.StreamType
-
-	// StreamName writes to a stream that already exists instead of creating one.
-	// StreamType is ignored when it is set.
-	StreamName string
-
-	// DisableWriteRetries stops bqsink from turning the client library's automatic
-	// write retries on. The zero value leaves them on, since a row that never lands
-	// is what bqsink is for; turn them off where an append being sent twice matters
-	// more than it arriving, which is the exactly-once pattern the client library
-	// warns they complicate.
-	//
-	// It says what bqsink does rather than what the stream ends up doing: the client
-	// library has no way to switch retries back off, so an EnableWriteRetries(true)
-	// of your own in WriterOptions still stands.
-	DisableWriteRetries bool
-
-	// ClientOptions configure the managedwriter client.
-	ClientOptions []option.ClientOption
-
-	// WriterOptions configure the stream. bqsink applies these first and then sets
-	// the destination table and the schema descriptor itself, so an option naming
-	// either of those has no effect: the relation and the declared schema are the
-	// source of truth.
-	WriterOptions []managedwriter.WriterOption
+// LoggerBindable is implemented by a writer with something to log. NewSinker
+// hands it the logger WithLogger settled on, already carrying the relation.
+type LoggerBindable interface {
+	BindLogger(logger *slog.Logger)
 }
 
-// Validate implements Validator.
-func (w *StorageWrite) Validate() error {
-	if w.StreamName != "" && w.StreamType != "" {
-		return errors.New("StorageWrite: StreamName and StreamType are mutually exclusive, since a stream that already exists has its type fixed")
-	}
-	switch w.StreamType {
-	case "", managedwriter.DefaultStream, managedwriter.CommittedStream:
-		return nil
-	case managedwriter.PendingStream:
-		return fmt.Errorf("StorageWrite: StreamType %s is not supported, because bqsink does not commit a pending stream and its rows would never become visible", w.StreamType)
-	case managedwriter.BufferedStream:
-		return fmt.Errorf("StorageWrite: StreamType %s is not supported, because bqsink does not advance a buffered stream's offset and its rows would never become visible", w.StreamType)
-	}
-	return fmt.Errorf("StorageWrite: unknown StreamType %q", w.StreamType)
+// ResolvedResult returns a WriteResult that has already settled, which is what a
+// transport writing its rows before it returns hands back.
+func ResolvedResult(n int, err error) WriteResult {
+	return resolvedResult{n: n, err: err}
+}
+
+type resolvedResult struct {
+	n   int
+	err error
+}
+
+func (r resolvedResult) Wait(context.Context) (int, error) {
+	return r.n, r.err
 }
 
 // Stager puts the rows somewhere a load job can read them, instead of uploading
@@ -137,19 +125,10 @@ type Stager interface {
 }
 
 // LoadJobs writes rows by rendering them as newline delimited JSON and submitting
-// a BigQuery load job.
+// a BigQuery load job. It is the settings a LoadJobsWriter is made from.
 //
-// One WriteRows is one load job, so how many rows a job carries is decided by how
-// many rows a single Sink is given. LoadJobs does not accumulate rows across calls:
-// writing them one at a time submits a load job each time, which a table's daily
-// job quota will not stand for. Give Sink a whole batch, or accumulate before it.
-//
-// A load job is submitted synchronously, so every WriteRows blocks until BigQuery
-// finishes the job, which takes seconds to minutes. Nothing is serialised on a
-// lock, so concurrent calls submit concurrent jobs.
-//
-// A load job is all or nothing: WriteRows returns len(rows) or, having retried
-// under RetryPolicy, 0 and an error. Rows are never left half written.
+// A load job is all or nothing: the rows of one job either all land or, having
+// been retried under RetryPolicy, none do. Rows are never left half written.
 //
 // Rows are uploaded with the load job itself unless Staging is set. Set it to
 // bqgcs.Staging to put them in Cloud Storage first, which suits large batches.
@@ -163,9 +142,30 @@ type LoadJobs struct {
 	// to a policy of your own to change that, and note that returning a bare
 	// gax.OnErrorFunc places no limit on the number of attempts.
 	//
-	// It is called once per WriteRows, because a gax.Retryer carries the state of
+	// It is called once per load job, because a gax.Retryer carries the state of
 	// its backoff and cannot be reused.
 	RetryPolicy func() gax.Retryer
+
+	// FlushRows gathers rows across calls and submits them as one load job once
+	// this many are held, rather than submitting a job per WriteRows. A table's
+	// daily job quota is what makes that worth doing: writing a row at a time
+	// without it submits a load job each time.
+	//
+	// The zero value submits a job per WriteRows.
+	//
+	// Waiting on a WriteResult submits the batch its rows are in, so what a batch
+	// ends up carrying depends on when the rows are waited for. Several goroutines
+	// writing at once share a job, which each of them then waits for: the rows of
+	// every call that joined the batch before one of them waited travel together,
+	// and none of the calls gives up its own answer for it. One goroutine waiting
+	// on each call in turn gets a job per call, since there is nobody else to
+	// gather rows from; it is Flush that gathers rows for a caller like that, or
+	// waiting on the results later rather than at once.
+	//
+	// A batch reaching this many rows is submitted by the call that filled it,
+	// which is what keeps the rows held here bounded, and Flush or Close submits
+	// what is left.
+	FlushRows int
 }
 
 func (w *LoadJobs) retryPolicy() func() gax.Retryer {
@@ -177,6 +177,9 @@ func (w *LoadJobs) retryPolicy() func() gax.Retryer {
 
 // Validate implements Validator.
 func (w *LoadJobs) Validate() error {
+	if w.FlushRows < 0 {
+		return fmt.Errorf("LoadJobs: FlushRows is %d, which is not a number of rows", w.FlushRows)
+	}
 	if v, ok := w.Staging.(Validator); ok {
 		if err := v.Validate(); err != nil {
 			return fmt.Errorf("LoadJobs: %w", err)
@@ -185,43 +188,366 @@ func (w *LoadJobs) Validate() error {
 	return nil
 }
 
-// Open implements WriteStrategy. It contacts BigQuery only when a load job is
-// submitted, so opening never fails.
-func (w *LoadJobs) Open(_ context.Context, table *bigquery.Table, schema bigquery.Schema, logger *slog.Logger) (RowWriter, error) {
-	var loader jobLoader = tableLoader{table: table, logger: logger}
-	if w.Staging != nil {
-		loader = stagedLoader{table: table, stager: w.Staging, logger: logger}
+// NewWriter returns a writer that loads rows into the table relation names.
+//
+// It does not contact BigQuery: a load job is the first thing that does, and the
+// schema it carries arrives with BindSchema. An empty ProjectID on relation is
+// filled in from the client.
+func (w *LoadJobs) NewWriter(client *bigquery.Client, relation Relation) (*LoadJobsWriter, error) {
+	if client == nil {
+		return nil, errors.New("bqsink: LoadJobs.NewWriter: client is nil")
 	}
-	return &loadJobsWriter{
+	if err := relation.validate(); err != nil {
+		return nil, err
+	}
+	if relation.ProjectID == "" {
+		relation.ProjectID = client.Project()
+	}
+	if err := w.Validate(); err != nil {
+		return nil, fmt.Errorf("bqsink: %w", err)
+	}
+	table := relation.table(client)
+	var loader jobLoader = tableLoader{table: table}
+	if w.Staging != nil {
+		loader = stagedLoader{table: table, stager: w.Staging}
+	}
+	return &LoadJobsWriter{
+		relation:    relation,
+		client:      client,
 		loader:      loader,
-		schema:      schema,
 		retryPolicy: w.retryPolicy(),
-		logger:      logger,
+		flushRows:   w.FlushRows,
+		logger:      slog.New(slog.DiscardHandler),
 	}, nil
+}
+
+// LoadJobsWriter writes rows with BigQuery load jobs.
+//
+// Where FlushRows asks for it, rows gather here until a job's worth of them has
+// arrived. What that means for a caller is settled by when it waits on the
+// WriteResults: waiting at once submits a job per call, and waiting later lets
+// the rows of several calls travel together.
+//
+// Nothing is serialised on a lock while a job runs, so concurrent calls submit
+// concurrent jobs, and a job carries the rows of every call that filled its
+// batch. A failure is reported to each of those calls, and to Close when no
+// caller ever asked.
+type LoadJobsWriter struct {
+	relation    Relation
+	client      *bigquery.Client
+	loader      jobLoader
+	retryPolicy func() gax.Retryer
+	flushRows   int
+
+	mu       sync.Mutex
+	idle     *sync.Cond
+	inflight int
+	logger   *slog.Logger
+	schema   bigquery.Schema
+	open     *loadBatch
+	failed   []*loadBatch
+	closed   bool
+}
+
+// settled returns the condition Close waits on for the jobs still running. It is
+// made on first use so that a writer built as a struct literal, which the tests
+// do, needs nothing of the sort. Its caller holds mu, which is what it guards.
+func (w *LoadJobsWriter) settled() *sync.Cond {
+	if w.idle == nil {
+		w.idle = sync.NewCond(&w.mu)
+	}
+	return w.idle
+}
+
+// loadBatch is the rows of one load job, shared by the WriteResults of every
+// WriteRows that put rows in it.
+//
+// claimed is what keeps a batch to one job: whoever wins it submits, and everyone
+// else waits for done. err is only read once done is closed.
+//
+// unread counts the WriteResults of this batch that have not reported its outcome
+// yet, so that a failure is still Close's to report while any one of the calls that
+// filled the batch has not asked. One caller waiting does not answer for another.
+type loadBatch struct {
+	rows    []Row
+	claimed atomic.Bool
+	done    chan struct{}
+	err     error
+	unread  atomic.Int32
+}
+
+func newLoadBatch() *loadBatch {
+	return &loadBatch{done: make(chan struct{})}
+}
+
+// Relation implements RowsWriter.
+func (w *LoadJobsWriter) Relation() Relation { return w.relation }
+
+// Client implements RowsWriter.
+func (w *LoadJobsWriter) Client() *bigquery.Client { return w.client }
+
+// BindLogger implements LoggerBindable.
+func (w *LoadJobsWriter) BindLogger(logger *slog.Logger) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.logger = logger
+}
+
+// BindSchema implements RowsWriter. The schema is what a load job declares, so
+// nothing can be written before it arrives.
+func (w *LoadJobsWriter) BindSchema(_ context.Context, schema bigquery.Schema) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(schema) == 0 {
+		return errors.New("bqsink: LoadJobsWriter: the schema has no columns")
+	}
+	if w.schema != nil {
+		return errors.New("bqsink: LoadJobsWriter: a schema is already bound")
+	}
+	w.schema = schema
+	return nil
+}
+
+// WriteRows implements RowsWriter.
+//
+// The rows join the batch being gathered, and the result returned settles when
+// that batch's load job has finished. A batch reaching FlushRows is submitted by
+// the call that filled it, so the rows held here stay bounded.
+func (w *LoadJobsWriter) WriteRows(ctx context.Context, rows []Row) (WriteResult, error) {
+	if len(rows) == 0 {
+		return ResolvedResult(0, nil), nil
+	}
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return nil, errors.New("bqsink: LoadJobsWriter: the writer is closed")
+	}
+	if w.schema == nil {
+		w.mu.Unlock()
+		return nil, errors.New("bqsink: LoadJobsWriter: no schema is bound yet")
+	}
+	if w.open == nil {
+		w.open = newLoadBatch()
+	}
+	batch := w.open
+	batch.rows = append(batch.rows, rows...)
+	batch.unread.Add(1)
+	result := &loadResult{writer: w, batch: batch, rows: len(rows)}
+	if len(batch.rows) < w.flushRows {
+		w.mu.Unlock()
+		return result, nil
+	}
+	w.open = nil
+	w.mu.Unlock()
+	w.submit(ctx, batch)
+	return result, nil
+}
+
+// Flush submits the rows FlushRows is holding back, without waiting on each
+// WriteResult in turn. It is what a caller gathering rows over time calls, from a
+// ticker or once a batch is worth sending.
+//
+// It returns the load job's error, which is the same one the WriteResults of the
+// rows it sent report.
+func (w *LoadJobsWriter) Flush(ctx context.Context) error {
+	w.mu.Lock()
+	batch := w.open
+	w.open = nil
+	w.mu.Unlock()
+	if batch == nil {
+		return nil
+	}
+	return w.sendAndWait(ctx, batch)
+}
+
+// Close submits what is still held and reports what nothing else would.
+//
+// Two things are reported here. Rows FlushRows was holding back are sent, since
+// closing is the last chance to send them. And a load job that failed goes into
+// the error too while any of the calls whose rows were in it has not waited on its
+// WriteResult, because that call would otherwise never be told. One caller waiting
+// does not answer for another sharing the batch, so the same failure can reach both
+// a Wait and Close.
+//
+// A job another goroutine is still running is waited for first, so that its
+// outcome is not missed by closing at the wrong moment. Closing twice is harmless.
+func (w *LoadJobsWriter) Close(ctx context.Context) error {
+	w.mu.Lock()
+	w.closed = true
+	batch := w.open
+	w.open = nil
+	w.mu.Unlock()
+
+	var errs []error
+	if batch != nil {
+		if err := w.sendAndWait(ctx, batch); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	w.mu.Lock()
+	// A job another goroutine started is waited for here rather than left behind:
+	// its failure reaches w.failed only when it finishes, and a Close that returned
+	// before then would be the last chance to report it going by unnoticed.
+	for w.inflight > 0 {
+		w.settled().Wait()
+	}
+	unread := retainUnread(w.failed)
+	w.failed = nil
+	w.mu.Unlock()
+	for _, b := range unread {
+		errs = append(errs, fmt.Errorf("bqsink: %d row(s) did not land and their result was never waited for: %w",
+			len(b.rows), b.err))
+	}
+	return errors.Join(errs...)
+}
+
+// settle sends the batch if it is still gathering rows and returns its outcome,
+// which is what a WriteResult reports.
+func (w *LoadJobsWriter) settle(ctx context.Context, batch *loadBatch) error {
+	w.mu.Lock()
+	if w.open == batch {
+		// No more rows join a batch on its way out.
+		w.open = nil
+	}
+	w.mu.Unlock()
+	return w.sendAndWait(ctx, batch)
+}
+
+// sendAndWait submits the batch unless someone else already is, and then waits
+// for whoever did.
+func (w *LoadJobsWriter) sendAndWait(ctx context.Context, batch *loadBatch) error {
+	w.submit(ctx, batch)
+	select {
+	case <-batch.done:
+		return batch.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// submit runs the batch's load job, once. A caller that does not win the batch
+// returns straight away and waits for the one that did.
+func (w *LoadJobsWriter) submit(ctx context.Context, batch *loadBatch) {
+	if !batch.claimed.CompareAndSwap(false, true) {
+		return
+	}
+	w.mu.Lock()
+	schema, logger := w.schema, w.logger
+	w.inflight++
+	w.mu.Unlock()
+	err := w.load(ctx, batch.rows, schema, logger)
+	// Settled before the batch is put anywhere anyone else can reach it, so that
+	// Close never reads the outcome of a batch that has none yet, and closing done
+	// last is what releases the waiters.
+	batch.err = err
+	w.mu.Lock()
+	if err != nil {
+		// Kept so that Close can report a failure no WriteResult was ever asked
+		// about. Batches every result has read are dropped rather than piling up.
+		w.failed = append(retainUnread(w.failed), batch)
+	}
+	w.inflight--
+	if w.inflight == 0 {
+		w.settled().Broadcast()
+	}
+	w.mu.Unlock()
+	close(batch.done)
+}
+
+func (w *LoadJobsWriter) load(ctx context.Context, rows []Row, schema bigquery.Schema, logger *slog.Logger) error {
+	var buf bytes.Buffer
+	for i := range rows {
+		line, err := encodeJSONRow(rows[i].Values, schema)
+		if err != nil {
+			return err
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	logger.DebugContext(ctx, "loading rows",
+		slog.Int("rows", len(rows)),
+		slog.Int("bytes", buf.Len()))
+	return retrying(ctx, logger, "load", w.retryPolicy, func(ctx context.Context) error {
+		return w.loader.load(ctx, buf.Bytes(), schema, logger)
+	})
+}
+
+// retainUnread drops the batches every WriteResult of which has reported the
+// outcome, leaving the ones somebody was never told about.
+func retainUnread(batches []*loadBatch) []*loadBatch {
+	kept := batches[:0]
+	for _, b := range batches {
+		if b.unread.Load() > 0 {
+			kept = append(kept, b)
+		}
+	}
+	return kept
+}
+
+// loadResult reports the outcome of the batch its rows went into.
+//
+// read keeps this one call's share of the batch's unread count to a single
+// decrement, so that waiting twice does not make Close think another caller has
+// been told.
+type loadResult struct {
+	writer *LoadJobsWriter
+	batch  *loadBatch
+	rows   int
+	read   atomic.Bool
+}
+
+// Wait implements WriteResult. It submits the batch these rows are in when
+// nothing else has, which is what makes waiting at once equivalent to writing
+// without a buffer at all.
+func (r *loadResult) Wait(ctx context.Context) (int, error) {
+	err := r.writer.settle(ctx, r.batch)
+	if err != nil && ctx.Err() != nil && !isBatchSettled(r.batch) {
+		// The wait gave up rather than the batch, so this call has not been told
+		// what became of its rows and Close still owes it an answer.
+		return 0, err
+	}
+	if r.read.CompareAndSwap(false, true) {
+		r.batch.unread.Add(-1)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return r.rows, nil
+}
+
+func isBatchSettled(batch *loadBatch) bool {
+	select {
+	case <-batch.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // jobLoader submits the rows and waits for BigQuery to finish. It exists so that
 // the writer can be tested without BigQuery.
+//
+// The logger is passed in rather than held, because a writer is given its logger
+// after it is built.
 type jobLoader interface {
-	load(ctx context.Context, rows []byte, schema bigquery.Schema) error
+	load(ctx context.Context, rows []byte, schema bigquery.Schema, logger *slog.Logger) error
 }
 
 type tableLoader struct {
-	table  *bigquery.Table
-	logger *slog.Logger
+	table *bigquery.Table
 }
 
 // load submits a load job with an explicit schema and CreateNever, leaving the
-// table's shape entirely to Migrate.
-func (l tableLoader) load(ctx context.Context, rows []byte, schema bigquery.Schema) error {
+// table's shape entirely to the migration.
+func (l tableLoader) load(ctx context.Context, rows []byte, schema bigquery.Schema, logger *slog.Logger) error {
 	source := bigquery.NewReaderSource(bytes.NewReader(rows))
 	source.SourceFormat = bigquery.JSON
 	source.Schema = schema
-	return runLoader(ctx, l.table, source, l.logger)
+	return runLoader(ctx, l.table, source, logger)
 }
 
 // runLoader submits the load job and waits for it, with an explicit schema and
-// CreateNever so that the table's shape is left entirely to Migrate.
+// CreateNever so that the table's shape is left entirely to the migration.
 func runLoader(ctx context.Context, table *bigquery.Table, source bigquery.LoadSource, logger *slog.Logger) error {
 	loader := table.LoaderFrom(source)
 	loader.WriteDisposition = bigquery.WriteAppend
@@ -254,15 +580,14 @@ func runLoader(ctx context.Context, table *bigquery.Table, source bigquery.LoadS
 type stagedLoader struct {
 	table  *bigquery.Table
 	stager Stager
-	logger *slog.Logger
 }
 
-func (l stagedLoader) load(ctx context.Context, rows []byte, schema bigquery.Schema) error {
+func (l stagedLoader) load(ctx context.Context, rows []byte, schema bigquery.Schema, logger *slog.Logger) error {
 	uri, cleanup, err := l.stager.Stage(ctx, rows)
 	if err != nil {
 		return fmt.Errorf("bqsink: stage rows for %s: %w", l.table.FullyQualifiedName(), err)
 	}
-	l.logger.DebugContext(ctx, "staged the rows for a load job",
+	logger.DebugContext(ctx, "staged the rows for a load job",
 		slog.String("uri", uri),
 		slog.Int("bytes", len(rows)))
 	if cleanup != nil {
@@ -271,7 +596,7 @@ func (l stagedLoader) load(ctx context.Context, rows []byte, schema bigquery.Sch
 			// failure to tidy up is not worth overriding that with; it is only logged,
 			// and what is left behind needs removing by hand.
 			if cerr := cleanup(ctx); cerr != nil {
-				l.logger.WarnContext(ctx, "could not remove the staged rows",
+				logger.WarnContext(ctx, "could not remove the staged rows",
 					slog.String("uri", uri),
 					slog.Any("error", cerr))
 			}
@@ -280,46 +605,5 @@ func (l stagedLoader) load(ctx context.Context, rows []byte, schema bigquery.Sch
 	source := bigquery.NewGCSReference(uri)
 	source.SourceFormat = bigquery.JSON
 	source.Schema = schema
-	return runLoader(ctx, l.table, source, l.logger)
-}
-
-// loadJobsWriter holds nothing that changes, so concurrent writes need no lock.
-type loadJobsWriter struct {
-	loader      jobLoader
-	schema      bigquery.Schema
-	retryPolicy func() gax.Retryer
-	logger      *slog.Logger
-}
-
-// WriteRows implements RowWriter. It submits one load job for rows and returns
-// len(rows) once BigQuery has finished it.
-func (w *loadJobsWriter) WriteRows(ctx context.Context, rows []Row) (int, error) {
-	if len(rows) == 0 {
-		return 0, nil
-	}
-	var buf bytes.Buffer
-	for i := range rows {
-		line, err := encodeJSONRow(rows[i].Values, w.schema)
-		if err != nil {
-			return 0, err
-		}
-		buf.Write(line)
-		buf.WriteByte('\n')
-	}
-	w.logger.DebugContext(ctx, "loading rows",
-		slog.Int("rows", len(rows)),
-		slog.Int("bytes", buf.Len()))
-	err := retrying(ctx, w.logger, "load", w.retryPolicy, func(ctx context.Context) error {
-		return w.loader.load(ctx, buf.Bytes(), w.schema)
-	})
-	if err != nil {
-		return 0, err
-	}
-	return len(rows), nil
-}
-
-// Close implements RowWriter. A load job holds nothing once it has finished, so
-// there is nothing to release.
-func (w *loadJobsWriter) Close(context.Context) error {
-	return nil
+	return runLoader(ctx, l.table, source, logger)
 }

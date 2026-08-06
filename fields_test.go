@@ -184,19 +184,19 @@ func TestNamedEmbeddedStructIsAJSONColumn(t *testing.T) {
 func TestToRowPromotesEmbeddedValues(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[deepRow](testClient(t), testRelation())
+	s, err := testSinker[deepRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
-	row, err := s.toRow(deepRow{
+	row, err := s.plan.marshalRow(reflect.ValueOf(deepRow{
 		middleLevel: middleLevel{
 			embeddedBase: embeddedBase{ID: "abc", Kind: "k"},
 			Middle:       "m",
 		},
 		Name: "n",
-	})
+	}))
 	if err != nil {
-		t.Fatalf("toRow() error = %v", err)
+		t.Fatalf("marshalRow() error = %v", err)
 	}
 	want := map[string]bigquery.Value{
 		"id":     "abc",
@@ -205,24 +205,24 @@ func TestToRowPromotesEmbeddedValues(t *testing.T) {
 		"name":   "n",
 	}
 	if !reflect.DeepEqual(row, want) {
-		t.Errorf("toRow() = %#v, want %#v", row, want)
+		t.Errorf("marshalRow() = %#v, want %#v", row, want)
 	}
 }
 
 func TestToRowShadowedFieldUsesTheOuterValue(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[shadowingRow](testClient(t), testRelation())
+	s, err := testSinker[shadowingRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
-	row, err := s.toRow(shadowingRow{
+	row, err := s.plan.marshalRow(reflect.ValueOf(shadowingRow{
 		embeddedBase: embeddedBase{ID: "inner", Kind: "hidden"},
 		ID:           "outer",
 		Name:         "n",
-	})
+	}))
 	if err != nil {
-		t.Fatalf("toRow() error = %v", err)
+		t.Fatalf("marshalRow() error = %v", err)
 	}
 	if got := row["id"]; got != "outer" {
 		t.Errorf("row[id] = %#v, want the outer field's value", got)
@@ -237,16 +237,16 @@ func TestToRowShadowedFieldUsesTheOuterValue(t *testing.T) {
 func TestToRowWithANilEmbeddedPointer(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[ptrEmbedRow](testClient(t), testRelation())
+	s, err := testSinker[ptrEmbedRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
 
 	t.Run("a nil embedded pointer leaves its columns NULL", func(t *testing.T) {
 		t.Parallel()
-		row, err := s.toRow(ptrEmbedRow{Name: "n"})
+		row, err := s.plan.marshalRow(reflect.ValueOf(ptrEmbedRow{Name: "n"}))
 		if err != nil {
-			t.Fatalf("toRow() error = %v", err)
+			t.Fatalf("marshalRow() error = %v", err)
 		}
 		for _, column := range []string{"id", "kind"} {
 			got, ok := row[column]
@@ -264,13 +264,13 @@ func TestToRowWithANilEmbeddedPointer(t *testing.T) {
 
 	t.Run("a set embedded pointer contributes its values", func(t *testing.T) {
 		t.Parallel()
-		row, err := s.toRow(ptrEmbedRow{embeddedBase: &embeddedBase{ID: "i", Kind: "k"}, Name: "n"})
+		row, err := s.plan.marshalRow(reflect.ValueOf(ptrEmbedRow{embeddedBase: &embeddedBase{ID: "i", Kind: "k"}, Name: "n"}))
 		if err != nil {
-			t.Fatalf("toRow() error = %v", err)
+			t.Fatalf("marshalRow() error = %v", err)
 		}
 		want := map[string]bigquery.Value{"id": "i", "kind": "k", "name": "n"}
 		if !reflect.DeepEqual(row, want) {
-			t.Errorf("toRow() = %#v, want %#v", row, want)
+			t.Errorf("marshalRow() = %#v, want %#v", row, want)
 		}
 	})
 }
@@ -278,16 +278,16 @@ func TestToRowWithANilEmbeddedPointer(t *testing.T) {
 func TestLockedRowIgnoresTheMutex(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[lockedRow](testClient(t), testRelation())
+	s, err := testSinker[lockedRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
-	row, err := s.toRow(lockedRow{Name: "n"})
+	row, err := s.plan.marshalRow(reflect.ValueOf(lockedRow{Name: "n"}))
 	if err != nil {
-		t.Fatalf("toRow() error = %v", err)
+		t.Fatalf("marshalRow() error = %v", err)
 	}
 	want := map[string]bigquery.Value{"name": "n"}
 	if !reflect.DeepEqual(row, want) {
-		t.Errorf("toRow() = %#v, want %#v; an embedded sync.Mutex must not become a column", row, want)
+		t.Errorf("marshalRow() = %#v, want %#v; an embedded sync.Mutex must not become a column", row, want)
 	}
 }

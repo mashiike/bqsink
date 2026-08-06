@@ -174,8 +174,8 @@ func valueOf(t *testing.T, rec slog.Record, key string) slog.Value {
 func TestWithLoggerRejectsNil(t *testing.T) {
 	t.Parallel()
 
-	if _, err := New[simpleRow](testClient(t), testRelation(), WithLogger(nil)); err == nil {
-		t.Fatal("New() error = nil, want WithLogger to reject a nil logger")
+	if _, err := testSinker[simpleRow](t, WithLogger(nil)); err == nil {
+		t.Fatal("NewSinker() error = nil, want WithLogger to reject a nil logger")
 	}
 }
 
@@ -183,9 +183,9 @@ func TestEveryRecordNamesTheRelation(t *testing.T) {
 	t.Parallel()
 
 	rec, logger := recordingLogger()
-	s := newTestSinker[simpleRow](t, &fakeTable{metadataErr: notFoundErr()}, WithLogger(logger))
-	if err := s.Migrate(t.Context()); err != nil {
-		t.Fatalf("Migrate() error = %v", err)
+	s := newTestSinker[simpleRow](t, &fakeTable{metadataErr: notFoundErr()}, nil, WithLogger(logger))
+	if err := s.start(t.Context()); err != nil {
+		t.Fatalf("start() error = %v", err)
 	}
 	records := rec.all()
 	if len(records) == 0 {
@@ -207,9 +207,9 @@ func TestMigrateLogsWhatItChanged(t *testing.T) {
 	t.Run("creating the table", func(t *testing.T) {
 		t.Parallel()
 		rec, logger := recordingLogger()
-		s := newTestSinker[simpleRow](t, &fakeTable{metadataErr: notFoundErr()}, WithLogger(logger))
-		if err := s.Migrate(t.Context()); err != nil {
-			t.Fatalf("Migrate() error = %v", err)
+		s := newTestSinker[simpleRow](t, &fakeTable{metadataErr: notFoundErr()}, nil, WithLogger(logger))
+		if err := s.start(t.Context()); err != nil {
+			t.Fatalf("start() error = %v", err)
 		}
 		record := rec.only(t, slog.LevelInfo, "created the table")
 		if got := stringsOf(t, record, "columns"); !slices.Equal(got, []string{"Name", "Count"}) {
@@ -221,9 +221,9 @@ func TestMigrateLogsWhatItChanged(t *testing.T) {
 		t.Parallel()
 		rec, logger := recordingLogger()
 		fake := migratedTableFor(bigquery.Schema{{Name: "Name", Type: bigquery.StringFieldType}})
-		s := newTestSinker[simpleRow](t, fake, WithLogger(logger))
-		if err := s.Migrate(t.Context()); err != nil {
-			t.Fatalf("Migrate() error = %v", err)
+		s := newTestSinker[simpleRow](t, fake, nil, WithLogger(logger))
+		if err := s.start(t.Context()); err != nil {
+			t.Fatalf("start() error = %v", err)
 		}
 		record := rec.only(t, slog.LevelInfo, "brought the table's schema up to the declaration")
 		if got := stringsOf(t, record, "added_columns"); !slices.Equal(got, []string{"Count"}) {
@@ -239,9 +239,9 @@ func TestMigrateLogsWhatItChanged(t *testing.T) {
 			{Name: "Count", Type: bigquery.IntegerFieldType},
 			{Name: "legacy", Type: bigquery.StringFieldType},
 		})
-		s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(SyncAllColumns{}, nil), WithLogger(logger))
-		if err := s.Migrate(t.Context()); err != nil {
-			t.Fatalf("Migrate() error = %v", err)
+		s := newTestSinker[simpleRow](t, fake, nil, WithMigrationStrategy(SyncAllColumns{}, nil), WithLogger(logger))
+		if err := s.start(t.Context()); err != nil {
+			t.Fatalf("start() error = %v", err)
 		}
 		record := rec.only(t, slog.LevelWarn, "dropped columns, and the data they held is gone")
 		if got := stringsOf(t, record, "columns"); !slices.Equal(got, []string{"legacy"}) {
@@ -256,9 +256,9 @@ func TestMigrateLogsWhatItChanged(t *testing.T) {
 			{Name: "Name", Type: bigquery.StringFieldType},
 			{Name: "Count", Type: bigquery.IntegerFieldType},
 		})
-		s := newTestSinker[simpleRow](t, fake, WithLogger(logger))
-		if err := s.Migrate(t.Context()); err != nil {
-			t.Fatalf("Migrate() error = %v", err)
+		s := newTestSinker[simpleRow](t, fake, nil, WithLogger(logger))
+		if err := s.start(t.Context()); err != nil {
+			t.Fatalf("start() error = %v", err)
 		}
 		rec.only(t, slog.LevelDebug, "the table needs no change")
 		for _, record := range rec.all() {
@@ -286,9 +286,9 @@ func TestStrategyLogsTheDifferenceItLeaves(t *testing.T) {
 	t.Run("MigrationNone warns that it reconciles nothing", func(t *testing.T) {
 		t.Parallel()
 		rec, logger := recordingLogger()
-		s := newTestSinker[simpleRow](t, tableWithLegacy(), WithMigrationStrategy(MigrationNone{}, nil), WithLogger(logger))
-		if err := s.Migrate(t.Context()); err != nil {
-			t.Fatalf("Migrate() error = %v", err)
+		s := newTestSinker[simpleRow](t, tableWithLegacy(), nil, WithMigrationStrategy(MigrationNone{}, nil), WithLogger(logger))
+		if err := s.start(t.Context()); err != nil {
+			t.Fatalf("start() error = %v", err)
 		}
 		record := rec.only(t, slog.LevelWarn, "the table differs from the declaration and MigrationNone leaves it as it is")
 		if got := stringsOf(t, record, "undeclared_columns"); !slices.Equal(got, []string{"legacy"}) {
@@ -299,9 +299,9 @@ func TestStrategyLogsTheDifferenceItLeaves(t *testing.T) {
 	t.Run("AppendNewColumns says which columns it keeps", func(t *testing.T) {
 		t.Parallel()
 		rec, logger := recordingLogger()
-		s := newTestSinker[simpleRow](t, tableWithLegacy(), WithLogger(logger))
-		if err := s.Migrate(t.Context()); err != nil {
-			t.Fatalf("Migrate() error = %v", err)
+		s := newTestSinker[simpleRow](t, tableWithLegacy(), nil, WithLogger(logger))
+		if err := s.start(t.Context()); err != nil {
+			t.Fatalf("start() error = %v", err)
 		}
 		record := rec.only(t, slog.LevelInfo, "the table has columns the declaration does not, and AppendNewColumns keeps them")
 		if got := stringsOf(t, record, "columns"); !slices.Equal(got, []string{"legacy"}) {
@@ -312,12 +312,12 @@ func TestStrategyLogsTheDifferenceItLeaves(t *testing.T) {
 	t.Run("SyncAllColumns warns about an ignored column that differs", func(t *testing.T) {
 		t.Parallel()
 		rec, logger := recordingLogger()
-		s := newTestSinker[simpleRow](t, tableWithLegacy(),
+		s := newTestSinker[simpleRow](t, tableWithLegacy(), nil,
 			WithMigrationStrategy(SyncAllColumns{IgnoreColumns: []string{"legacy"}}, nil),
 			WithLogger(logger),
 		)
-		if err := s.Migrate(t.Context()); err != nil {
-			t.Fatalf("Migrate() error = %v", err)
+		if err := s.start(t.Context()); err != nil {
+			t.Fatalf("start() error = %v", err)
 		}
 		record := rec.only(t, slog.LevelWarn,
 			"IgnoreColumns holds columns that differ from the declaration, and they are left as they are")
@@ -333,12 +333,12 @@ func TestStrategyLogsTheDifferenceItLeaves(t *testing.T) {
 			{Name: "Name", Type: bigquery.StringFieldType},
 			{Name: "Count", Type: bigquery.IntegerFieldType},
 		})
-		s := newTestSinker[simpleRow](t, fake,
+		s := newTestSinker[simpleRow](t, fake, nil,
 			WithMigrationStrategy(SyncAllColumns{IgnoreColumns: []string{"legacy"}}, nil),
 			WithLogger(logger),
 		)
-		if err := s.Migrate(t.Context()); err != nil {
-			t.Fatalf("Migrate() error = %v", err)
+		if err := s.start(t.Context()); err != nil {
+			t.Fatalf("start() error = %v", err)
 		}
 		for _, record := range rec.all() {
 			if record.Level >= slog.LevelInfo {
@@ -350,9 +350,9 @@ func TestStrategyLogsTheDifferenceItLeaves(t *testing.T) {
 
 const retryMessage = "retrying after a failure a later attempt may get past"
 
-// TestRetryLogsOnlyTheFailuresItSwallows exercises loadJobsWriter directly,
-// since retrying a write is its own responsibility rather than the Sinker's:
-// the Sinker only retries Migrate.
+// TestRetryLogsOnlyTheFailuresItSwallows exercises LoadJobsWriter directly,
+// since retrying a write is its own responsibility rather than the Sinker's: the
+// Sinker only retries its own migration, run from start.
 func TestRetryLogsOnlyTheFailuresItSwallows(t *testing.T) {
 	t.Parallel()
 
@@ -362,10 +362,14 @@ func TestRetryLogsOnlyTheFailuresItSwallows(t *testing.T) {
 		t.Parallel()
 		rec, logger := recordingLogger()
 		loader := &fakeLoader{errs: []error{unavailableErr(), unavailableErr(), nil}}
-		w := &loadJobsWriter{loader: loader, schema: abSchema(), retryPolicy: fastRetryPolicy, logger: logger}
+		w := &LoadJobsWriter{loader: loader, schema: abSchema(), retryPolicy: fastRetryPolicy, logger: logger}
 
-		if _, err := w.WriteRows(t.Context(), oneRow); err != nil {
+		res, err := w.WriteRows(t.Context(), oneRow)
+		if err != nil {
 			t.Fatalf("WriteRows() error = %v", err)
+		}
+		if _, err := res.Wait(t.Context()); err != nil {
+			t.Fatalf("Wait() error = %v", err)
 		}
 		warnings := rec.matching(slog.LevelWarn, retryMessage)
 		if len(warnings) != 2 {
@@ -391,13 +395,17 @@ func TestRetryLogsOnlyTheFailuresItSwallows(t *testing.T) {
 			errs[i] = unavailableErr()
 		}
 		loader := &fakeLoader{errs: errs}
-		w := &loadJobsWriter{loader: loader, schema: abSchema(), retryPolicy: fastRetryPolicy, logger: logger}
+		w := &LoadJobsWriter{loader: loader, schema: abSchema(), retryPolicy: fastRetryPolicy, logger: logger}
 
-		if _, err := w.WriteRows(t.Context(), oneRow); err == nil {
-			t.Fatal("WriteRows() error = nil, want the last failure")
+		res, err := w.WriteRows(t.Context(), oneRow)
+		if err != nil {
+			t.Fatalf("WriteRows() error = %v", err)
+		}
+		if _, err := res.Wait(t.Context()); err == nil {
+			t.Fatal("Wait() error = nil, want the last failure")
 		}
 		// Every attempt but the last was followed by another, and the last one's
-		// failure is the one WriteRows returned.
+		// failure is the one Wait returned.
 		if got := rec.count(slog.LevelWarn, retryMessage); got != migrateMaxRetries {
 			t.Errorf("%d retry warning(s), want %d for %d attempts; logged: %s",
 				got, migrateMaxRetries, migrateMaxRetries+1, rec.summary())
@@ -408,10 +416,14 @@ func TestRetryLogsOnlyTheFailuresItSwallows(t *testing.T) {
 		t.Parallel()
 		rec, logger := recordingLogger()
 		loader := &fakeLoader{errs: []error{forbiddenErr()}}
-		w := &loadJobsWriter{loader: loader, schema: abSchema(), retryPolicy: fastRetryPolicy, logger: logger}
+		w := &LoadJobsWriter{loader: loader, schema: abSchema(), retryPolicy: fastRetryPolicy, logger: logger}
 
-		if _, err := w.WriteRows(t.Context(), oneRow); err == nil {
-			t.Fatal("WriteRows() error = nil, want the permission failure")
+		res, err := w.WriteRows(t.Context(), oneRow)
+		if err != nil {
+			t.Fatalf("WriteRows() error = %v", err)
+		}
+		if _, err := res.Wait(t.Context()); err == nil {
+			t.Fatal("Wait() error = nil, want the permission failure")
 		}
 		if got := rec.count(slog.LevelWarn, retryMessage); got != 0 {
 			t.Errorf("%d retry warning(s), want none; logged: %s", got, rec.summary())
@@ -423,9 +435,9 @@ func TestRetryLogsOnlyTheFailuresItSwallows(t *testing.T) {
 		rec, logger := recordingLogger()
 		fake := migratedTableFor(bigquery.Schema{{Name: "Name", Type: bigquery.StringFieldType}})
 		fake.updateErrs = []error{etagErr(), nil}
-		s := newTestSinker[simpleRow](t, fake, WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, fastRetryPolicy), WithLogger(logger))
-		if err := s.Migrate(t.Context()); err != nil {
-			t.Fatalf("Migrate() error = %v", err)
+		s := newTestSinker[simpleRow](t, fake, nil, WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, fastRetryPolicy), WithLogger(logger))
+		if err := s.start(t.Context()); err != nil {
+			t.Fatalf("start() error = %v", err)
 		}
 		record := rec.only(t, slog.LevelWarn, retryMessage)
 		if got := stringOf(t, record, "operation"); got != "migrate" {
@@ -438,10 +450,9 @@ func TestTheWriterIsHandedTheLogger(t *testing.T) {
 	t.Parallel()
 
 	_, logger := recordingLogger()
-	writer := &fakeRowWriter{}
-	s := newTestSinker[nestedRow](t, migratedTable(),
+	writer := newFakeWriter(t)
+	s := newTestSinker[nestedRow](t, migratedTable(), writer,
 		WithMigrationStrategy(AppendNewColumns{}, nil),
-		WithWriteStrategy(&fakeWriteStrategy{writer: writer}),
 		WithLogger(logger),
 	)
 	if _, err := s.Sink(t.Context(), nestedRow{A: "a"}); err != nil {
@@ -449,8 +460,8 @@ func TestTheWriterIsHandedTheLogger(t *testing.T) {
 	}
 	writer.mu.Lock()
 	defer writer.mu.Unlock()
-	if writer.openedLogger == nil {
-		t.Error("Open was handed a nil logger, want the one the Sinker holds")
+	if writer.boundLogger == nil {
+		t.Error("BindLogger was not called, want the logger the Sinker holds")
 	}
 }
 
@@ -462,9 +473,9 @@ func TestWithoutALoggerNothingIsLogged(t *testing.T) {
 	slog.SetDefault(logger)
 	t.Cleanup(func() { slog.SetDefault(previous) })
 
-	s := newTestSinker[simpleRow](t, &fakeTable{metadataErr: notFoundErr()})
-	if err := s.Migrate(t.Context()); err != nil {
-		t.Fatalf("Migrate() error = %v", err)
+	s := newTestSinker[simpleRow](t, &fakeTable{metadataErr: notFoundErr()}, nil)
+	if err := s.start(t.Context()); err != nil {
+		t.Fatalf("start() error = %v", err)
 	}
 	if got := rec.all(); len(got) != 0 {
 		t.Errorf("%d record(s) reached the default logger, want none; logged: %s", len(got), rec.summary())

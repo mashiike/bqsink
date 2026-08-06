@@ -22,7 +22,7 @@ paths:
 
 **タグ解釈・ポインタの剥がし・`[]byte` の例外・REPEATED 判定・Marshaler の優先順位を2箇所に書いてはいけない。** 一度そうなっていて、片方が `isRepeated` を先に見て他方が Marshaler を先に見る、という非対称が生まれていた（偶然動いていた）。
 
-`plan_test.go` の `TestRowKeysMatchTheSchema` がこの drift 全体を守っている。`everythingRow` は全パターンを1つの型に詰めていて、`toRow` のキー集合と宣言スキーマの列名が完全一致することを検査する。**フィールドの形を増やしたらこの型に足す。**
+`plan_test.go` の `TestRowKeysMatchTheSchema` がこの drift 全体を守っている。`everythingRow` は全パターンを1つの型に詰めていて、`marshalRow` のキー集合と宣言スキーマの列名が完全一致することを検査する。**フィールドの形を増やしたらこの型に足す。**
 
 ## 優先順位（変えると利用者の期待が壊れる）
 
@@ -69,7 +69,7 @@ paths:
 
 ## Marshaler と衝突したらエラーにする（precedence にしない）
 
-`MarshalFunc[time.Time]` を登録した上で `bqsink:",date"` を書いたら `New` で失敗する。どちらかを黙って勝たせない。
+`MarshalFunc[time.Time]` を登録した上で `bqsink:",date"` を書いたら初回 `Sink` で失敗する。どちらかを黙って勝たせない。
 
 **エラー → precedence への緩和は後から非破壊でできるが、逆は利用者を壊す。** 迷ったので厳しい側から始めている。
 
@@ -133,19 +133,29 @@ repeated 列では意味が変わり「要素が0個」になる。nil と空 sl
 `AppendInfo` に `Time` や `RowID` があるのは利便性のためで、**利用者が `FillRow` の中で `time.Now()` や `uuid.NewString()` を呼んでも同じ結果になる**。それが成り立つのは呼び出し契約のため。
 
 ```
-Sink(ctx, v) → FillRow(コピー) → toRow → retrying{ Append }
-                    ↑1行1回                     ↑複数回ありうる
+Sink(ctx, rows) → FillRow(コピー) → marshalRow → retrying{ Append }
+                       ↑1行1回                        ↑複数回ありうる
 ```
 
 **この順序を崩してはいけない。** `FillRow` をリトライの内側に移すと `_ingestion_row_id` がリトライごとに変わり、重複排除に使えなくなる。`fill_test.go` の `TestRetryKeepsTheSameRowID` が守っている。
 
 `AppendInfo` に試行回数を入れないのも同じ理由。
 
-## 値レシーバの `FillRow` は `New` で弾く
+## `FillRow` が呼ばれない2つの形を `NewSinker` で弾く
 
-`FillRow` はコピーに対して呼ばれるので、値レシーバだと**書き換えたコピーが捨てられて列が空のまま黙って通る**。`rowFillerOf` が `reflect` で検出してエラーにしている。
+どちらも**列が空のまま黙って通る**ので、`checkRowFiller` がエラーにしている。**検査は `NewSinker`（`resolveDeclaration`）で走る** — 2026-08-05 までは初回 `Sink` だった。
 
-判定は「`*T` が実装している」かつ「`T`（値）も実装している」= 値レシーバ。`T` がポインタ型の場合は別経路で、その場合だけ**呼び出し側の値が書き換わる**（GoDoc に明記済み）。
+**1. 値レシーバの `FillRow`。** コピーに対して呼ばれるので、書き換えたコピーが捨てられる。判定は「行の型へのポインタが実装している」かつ「行の型自身も実装している」= 値レシーバ。行がポインタとして渡される場合は検査せず、その場合だけ**呼び出し側の値が書き換わる**（GoDoc に明記済み）。
+
+**2. promote されない `FillRow`（`checkUnpromotedFiller`）。** `reflect.StructOf` で組んだ型に `IngestionMetadata` を埋め込んでも `FillRow` は呼ばれない。**Go は実行時に組んだ型へ、埋め込み型の値レシーバのメソッドは promote するが、ポインタレシーバのメソッドは promote しない**（2026-08-05 に実測。`reflect.StructOf` の godoc は "does not support promoted methods of embedded fields" と書いているが、値レシーバは実際に promote される）。`IngestionMetadata.FillRow` はポインタレシーバなので、`DeclarationForType` 経由の無名型では `_ingestion_*` が空のまま書かれる。
+
+判定は「`*rt` が `RowFiller` を実装していない」かつ「直下に埋め込まれた型が実装している」。**この条件だと false positive が原理的に出ない**: promote が効いていれば `*rt` が実装しているので到達しない。コンパイル時の型（普通の struct）は全部 promote されるので影響を受けない。
+
+**ポインタで宣言された行（`DeclarationForType(reflect.PointerTo(rt))`）も同じ検査を通す。** 2026-08-05 のレビューで、`rt.Kind() == reflect.Pointer` の早期 return が検査を丸ごとバイパスしていた穴を実測で指摘され、`rt.Elem()` に対して検査する形に直した。**`reflect.StructOf` で作った型は、そのポインタにも埋め込みメソッドを promote しない**（値レシーバでも）ので、ポインタで渡せば通る、という抜け道を塞いでいる。普通の `*AccessLog` は `*T` が `RowFiller` を実装するので早期 return のまま。
+
+深さ1の埋め込みしか見ていない。宣言は直下に書くものなので足りている。
+
+**コピーを作るのは `fillable`**（`bqsink.go`）で、値なら `reflect.New(v.Type())` + `Elem().Set(v)`、ポインタならそのポインタを返す。`prepare` はその戻り値に対して `RowFiller` をアサートするので、アクセサを組み立てる関数は存在しない（`fillerFunc` は 2026-08-04 に削除した）。
 
 ## `_ingestion_` プレフィックスは実測で通ることを確認済み
 
@@ -161,4 +171,4 @@ Sink(ctx, v) → FillRow(コピー) → toRow → retrying{ Append }
 
 `fill_test.go` の `TestRowIDsSortByTime` が単調増加を検査している。
 
-`NewV7()` は `(UUID, error)` を返すので、`New` と `appendInfo` がエラーを返す形になっている。
+`NewV7()` は `(UUID, error)` を返すので、`NewSinker`（`SinkerID`）と `prepare`（`RowID`）がエラーを返す形になっている。

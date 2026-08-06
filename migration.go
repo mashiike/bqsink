@@ -263,7 +263,7 @@ func sameNestedSchema(want, got bigquery.Schema) bool {
 	return true
 }
 
-// TableState describes the destination table as Migrate found it.
+// TableState describes the destination table as the migration found it.
 type TableState struct {
 	// Exists reports whether the table exists.
 	Exists bool
@@ -464,7 +464,7 @@ var migrateBackoff = gax.Backoff{
 // four times, waiting between 200ms and 5s with jitter, and any other error is
 // returned immediately.
 //
-// It covers both a concurrent change to the table during Migrate and a transient
+// It covers both a concurrent change to the table during the migration and a transient
 // failure while writing.
 func DefaultRetryPolicy() gax.Retryer {
 	return &attemptLimiter{
@@ -490,7 +490,7 @@ func (l *attemptLimiter) Retry(err error) (time.Duration, bool) {
 	return l.retryer.Retry(err)
 }
 
-func (s *Sinker[T]) migrate(ctx context.Context) error {
+func (s *Sinker) migrate(ctx context.Context) error {
 	md, err := s.api.Metadata(ctx)
 	var state TableState
 	switch {
@@ -514,7 +514,7 @@ func (s *Sinker[T]) migrate(ctx context.Context) error {
 	return s.apply(ctx, md, change)
 }
 
-func (s *Sinker[T]) apply(ctx context.Context, md *bigquery.TableMetadata, change SchemaChange) error {
+func (s *Sinker) apply(ctx context.Context, md *bigquery.TableMetadata, change SchemaChange) error {
 	if md == nil {
 		if !change.CreateTable {
 			return fmt.Errorf("bqsink: %s: %w", s.relation, ErrTableMissing)
@@ -527,7 +527,7 @@ func (s *Sinker[T]) apply(ctx context.Context, md *bigquery.TableMetadata, chang
 	}
 	// Columns are added before any are dropped, so that a failure in between
 	// leaves the table holding more than the declaration asks for rather than
-	// less. Migrate reports the failure either way.
+	// less. The migration reports the failure either way.
 	if err := s.patchSchema(ctx, md, change); err != nil {
 		return err
 	}
@@ -537,7 +537,7 @@ func (s *Sinker[T]) apply(ctx context.Context, md *bigquery.TableMetadata, chang
 	return s.dropColumns(ctx, change.DropColumns)
 }
 
-func (s *Sinker[T]) createTable(ctx context.Context) error {
+func (s *Sinker) createTable(ctx context.Context) error {
 	if err := s.api.Create(ctx, s.newTableMetadata()); err != nil {
 		return fmt.Errorf("bqsink: create %s: %w", s.relation, err)
 	}
@@ -545,7 +545,7 @@ func (s *Sinker[T]) createTable(ctx context.Context) error {
 	return nil
 }
 
-func (s *Sinker[T]) newTableMetadata() *bigquery.TableMetadata {
+func (s *Sinker) newTableMetadata() *bigquery.TableMetadata {
 	md := &bigquery.TableMetadata{}
 	if s.metadata != nil {
 		copied := *s.metadata
@@ -555,7 +555,7 @@ func (s *Sinker[T]) newTableMetadata() *bigquery.TableMetadata {
 	return md
 }
 
-func (s *Sinker[T]) patchSchema(ctx context.Context, md *bigquery.TableMetadata, change SchemaChange) error {
+func (s *Sinker) patchSchema(ctx context.Context, md *bigquery.TableMetadata, change SchemaChange) error {
 	if len(change.AddColumns) == 0 && len(change.RelaxColumns) == 0 {
 		return nil
 	}
@@ -576,7 +576,7 @@ func (s *Sinker[T]) patchSchema(ctx context.Context, md *bigquery.TableMetadata,
 // dropColumns removes columns with an ALTER TABLE statement, which destroys their
 // data irreversibly. Only SyncAllColumns asks for this, and only for columns the
 // declaration no longer has and IgnoreColumns does not protect.
-func (s *Sinker[T]) dropColumns(ctx context.Context, names []string) error {
+func (s *Sinker) dropColumns(ctx context.Context, names []string) error {
 	drops := make([]string, len(names))
 	for i, name := range names {
 		if err := checkColumnName(name); err != nil {

@@ -42,11 +42,28 @@ return s.dropColumns(ctx, change.DropColumns)
 
 テーブルが存在せず `CreateTable` も要求されないときは `ErrTableMissing` を返す。書き込めないことが確定しているので早期に知らせる。
 
-## `Migrate` は失敗もキャッシュする
+## 遅延初期化は2段になった（`NewSinker` → `start`）
 
-`sync.Once` を使っているので、503 や IAM 権限の失敗は**プロセスが生きている間ずっと同じエラーを返す**。回復には再 `New` が必要。これは意図した設計。
+**2026-08-05 に3段（`settle` → `reconcile` → `writer`）から変わった。** 宣言が `NewSinker` の引数（`Declaration`）になったので、ローカルな解決は構築時に済む。
 
-**ctx は初回呼び出し側のものが使われる。** 後から別の ctx をキャンセルしても効かない。
+| 段 | 何をする | 失敗の性質 |
+|---|---|---|
+| `NewSinker` → `resolveDeclaration` | タグとメソッドから plan / schema / metadata を作る | **ローカル。** ネットワークに出ない。**キャッシュしない** — 構築が失敗するので `Sinker` が存在しない |
+| `start`（`startOnce`） | 実テーブルと和解し（`migrate`）、続けて `writer.BindSchema` を呼ぶ | **ネットワーク。** 412 / 503 はリトライで直る。結果は成否ともキャッシュ |
+
+**この分け方の根拠は変わっていない**（旧「3段を1つの `Once` に畳んではいけない」と同じ）: **タグの誤字と 503 を同じキャッシュスロットに乗せない。** 前者は何度リトライしても直らず、後者は直りうる。以前は `Once` を2つ持って分けていたが、今は**ローカルな失敗が `Once` に触れない**（コンストラクタが返す）ので、構造的に混ざらない。**`migrate` と `BindSchema` は両方ネットワークなので同じ `Once` でよい。**
+
+**型の一致検査は `Sink` にある。** `rt != s.rowType` ならエラー。宣言は構築時に確定しているので、`Once` の内側と外側を使い分ける必要はなくなった（旧 `settle` の罠が消えた）。
+
+**`api` が nil なら `start` はマイグレーションを飛ばす。** writer の `Client()` が nil のときで、`NewSinker` が `MigrationNone` 以外を拒否しているのでそこにしか到達しない。`BindSchema` は必ず呼ぶ。
+
+**その拒否は `checkStrategyWithoutAClient` にあり、値型とポインタ型の両方を見る**（`MigrationNone` / `*MigrationNone`）。`Plan` が値レシーバなので `&MigrationNone{}` も `MigrationStrategy` を満たし、片方だけ見ると**利用者は意図どおり渡しているのにエラーになる**。2026-08-05 のレビューで実測付きで指摘されて直した。**`MigrationNone{CreateIfMissing: true}` + client 無しもエラーにする** — 読めないテーブルは作れないので、黙って無視すると「作られたはず」という誤解を残す。
+
+## マイグレーションは失敗もキャッシュする
+
+`sync.Once` を使っているので、503 や IAM 権限の失敗は**プロセスが生きている間ずっと同じエラーを返す**。回復には再 `NewSinker` が必要。これは意図した設計。
+
+**ctx は初回 `Sink` の呼び出し側のものが使われる。** 後から別の ctx をキャンセルしても効かない。
 
 `sync.Once` の代わりに mutex + 成功フラグにすると失敗からリトライできるが、失敗し続ける間 `Sink` ごとに `Metadata` を叩くことになる。前者を選んでいる。
 
@@ -54,7 +71,7 @@ return s.dropColumns(ctx, change.DropColumns)
 
 `table.Update(ctx, tm, etag)` に `md.ETag` を渡している。**複数レプリカが同時に同じ列を追加しようとする競合は、BigQuery が 412 を返すのでリトライで解決する。** 自前でロックを作る必要はない。
 
-**リトライは `WithMigrationStrategy(strategy, retryPolicy)` の第2引数で決まる。** 2引数にしたのは、`nil` を渡す＝リトライしないことを呼び出し側に必ず表明させるため。1引数のままだと「412 の自己修復が黙って無効になっている」状態を作れてしまう。`WithMigrationStrategy` を呼ばなければ `New` が `AppendNewColumns{CreateIfMissing: true}` + `DefaultRetryPolicy` を入れるので、既定は安全側。
+**リトライは `WithMigrationStrategy(strategy, retryPolicy)` の第2引数で決まる。** 2引数にしたのは、`nil` を渡す＝リトライしないことを呼び出し側に必ず表明させるため。1引数のままだと「412 の自己修復が黙って無効になっている」状態を作れてしまう。`WithMigrationStrategy` を呼ばなければ `NewSinker` が `AppendNewColumns{CreateIfMissing: true}` + `DefaultRetryPolicy` を入れるので、既定は安全側。
 
 `retryPolicy` に `nil` を渡すと `retrying` が op を1回呼ぶだけになる（`gax.WithRetry(nil)` は使わない）。
 
@@ -69,9 +86,9 @@ HTTP: 412, 409, 429, 500, 502, 503, 504
 gRPC: Unavailable, DeadlineExceeded, ResourceExhausted, Internal, Aborted
 ```
 
-`DefaultRetryPolicy` は `Migrate` の既定と `LoadJobs.RetryPolicy` の既定の両方で使われる。以前 `isConcurrentChange`（412/409 のみ）を使っていて、書き込みに転用したときリトライが効かなかった。**テストヘルパー `fastRetryPolicy` も同じ判定関数を使うこと**（バックオフだけ速い）。
+`DefaultRetryPolicy` はマイグレーションの既定と `LoadJobs.RetryPolicy` の既定の両方で使われる。以前 `isConcurrentChange`（412/409 のみ）を使っていて、書き込みに転用したときリトライが効かなかった。**テストヘルパー `fastRetryPolicy` も同じ判定関数を使うこと**（バックオフだけ速い）。
 
-`retrying` は `Sinker` のメソッドではなくパッケージレベル関数（`retrying(ctx, logger, what, newRetryer, op)`）。`Migrate` と `loadJobsWriter.WriteRows` の両方から呼ぶため。**書き込みのリトライを `Sinker` 側に戻さないこと** — 理由は `.claude/rules/transports.md`。
+`retrying` は `Sinker` のメソッドではなくパッケージレベル関数（`retrying(ctx, logger, what, newRetryer, op)`）。`start` と `LoadJobsWriter.submit` の両方から呼ぶため。**書き込みのリトライを `Sinker` 側に戻さないこと** — 理由は `.claude/rules/transports.md`。
 
 `attemptLimiter` は gax が意図的に提供しない回数制限を足すためのもの。godoc に "MaxNumRetries / RPCDeadline is specifically not provided" とある。
 
@@ -85,16 +102,16 @@ gRPC: Unavailable, DeadlineExceeded, ResourceExhausted, Internal, Aborted
 
 `ALTER TABLE` に列名を文字列で埋め込むため、`checkColumnName` で BigQuery が許す文字（英数字とアンダースコア）だけを通す。**テーブル名は `Relation.quoted()` でバッククォートで囲む。**
 
-## `SinkerID` と `SinkerCreatedAt` は `New` で決まる
+## `SinkerID` と `SinkerCreatedAt` は `NewSinker` で決まる
 
-`New` の中で `newID()` と `time.Now()` を呼ぶ。**つまり `Sinker` インスタンスの生存期間を表す。**
+`NewSinker` の中で `newID()` と `time.Now()` を呼ぶ。**つまり `Sinker` インスタンスの生存期間を表す。**
 
-- バッチごとに `New` する使い方 → `_ingestion_id` はバッチ単位
+- バッチごとに `NewSinker` する使い方 → `_ingestion_id` はバッチ単位
 - 常駐プロセスが1つの `Sinker` を持ち続ける使い方 → プロセスが生きている間ずっと同じ ID
 
 常駐プロセスで「実行単位」を表したいなら作り直す。外から ID を渡す `WithSinkerID` は**まだ用意していない**。必要になったら足す（それまでは自前の `RowFiller` で対応できる）。
 
-`newID()` が失敗しうるので **`New` が UUID 生成のエラーを返す**。乱数源が読めないときだけ。
+`newID()` が失敗しうるので **`NewSinker` が UUID 生成のエラーを返す**。乱数源が読めないときだけ。
 
 ## `Relation` を独自型にした理由
 
@@ -106,7 +123,7 @@ gRPC: Unavailable, DeadlineExceeded, ResourceExhausted, Internal, Aborted
 
 ## スキーマを明示しても plan は必要
 
-行を書くには struct を歩く必要があるので、`buildRowPlan` が失敗する型は `BigQueryTableMetadata` でスキーマを書き切っても `New` が失敗する。**「スキーマを明示すればタグ推論を完全に回避できる」わけではない。**
+行を書くには struct を歩く必要があるので、`buildRowPlan` が失敗する型は `BigQueryTableMetadata` でスキーマを書き切っても初回 `Sink` が失敗する。**「スキーマを明示すればタグ推論を完全に回避できる」わけではない。**
 
 スキーマを外から渡す `WithSchema` / `WithTableMetadata` は削除済み（下記「宣言は行の型に属する」）。
 
@@ -115,6 +132,13 @@ gRPC: Unavailable, DeadlineExceeded, ResourceExhausted, Internal, Aborted
 ## 宣言は行の型に属する
 
 **テーブルの姿を外から渡す Option は作らない。** `WithSchema` / `WithTableMetadata` は一度存在したが 2026-07-29 に削除した。
+
+**2026-08-05 に `NewSinker(w, decl, opts...)` の必須引数として `Declaration` が入ったが、これはこの決定の反転ではない。** 区別すべきは2つ:
+
+- **宣言がどこに住むか** — 変わっていない。`DeclarationOf[T]()` は T のタグと `BigQueryTableMetadata` を読むだけで、宣言の内容を外から書く口はどこにもない
+- **宣言をいつ渡すか** — 変わった。初回 `Sink` の暗黙確定から、構築時の明示引数になった（fail-fast と、実行時型 `DeclarationForType` の正面玄関のため）
+
+**`WithSchema` 相当（スキーマの内容を Option や引数で渡す）はいま提案されても却下。** `Declaration` が受けるのは*型*で、*宣言の中身*ではない。`Declaration` に `Schema` フィールドを足したくなったら、それは削除した Option の再来。
 
 - スキーマ → struct タグ、またはタグで書けないもの（BIGNUMERIC の精度・列の policy tag・ネスト RECORD）は `TableDefiner.BigQueryTableMetadata()` の `Schema`
 - テーブルの description とラベル → 埋め込んだ `TableMeta` のタグ、または同じメソッド
@@ -127,7 +151,7 @@ gRPC: Unavailable, DeadlineExceeded, ResourceExhausted, Internal, Aborted
 
 `resolveSchema(metadata, plan)` は「`BigQueryTableMetadata` に `Schema` があればそれ、無ければタグ導出」の2択だけになった。`config` にスキーマもメタデータも持っていない。
 
-テストで「タグとメタデータの矛盾」を表で回すときは `New` ではなく `resolveTableMetadata` を直接呼ぶ。**メソッドは型ごとに1つしか書けないので、1つの型で複数の矛盾パターンを表現できない**（`layout_test.go`）。`New` 経由の end-to-end は1件だけ残してある。
+テストで「タグとメタデータの矛盾」を表で回すときは `settle` ではなく `resolveTableMetadata` を直接呼ぶ。**メソッドは型ごとに1つしか書けないので、1つの型で複数の矛盾パターンを表現できない**（`layout_test.go`）。`settle` 経由の end-to-end は1件だけ残してある。
 
 ## `TableMeta` は列を作らない埋め込みマーカー
 

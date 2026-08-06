@@ -2,6 +2,7 @@ package bqsink
 
 import (
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -188,7 +189,6 @@ func TestRequiredColumnRejectsNull(t *testing.T) {
 func TestStorageWriteWriterOptionsPutBqsinkLast(t *testing.T) {
 	t.Parallel()
 
-	table := &bigquery.Table{ProjectID: "p", DatasetID: "d", TableID: "t"}
 	md, err := rowDescriptor(abSchema())
 	if err != nil {
 		t.Fatalf("rowDescriptor() error = %v", err)
@@ -210,7 +210,7 @@ func TestStorageWriteWriterOptionsPutBqsinkLast(t *testing.T) {
 		},
 		{
 			name:     "an existing stream carries its name, the descriptor and write retries",
-			strategy: &StorageWrite{StreamName: "projects/p/datasets/d/tables/t/streams/s"},
+			strategy: &StorageWrite{StreamName: "projects/test-project/datasets/test_dataset/tables/test_table/streams/s"},
 			want:     3,
 		},
 		{
@@ -230,10 +230,47 @@ func TestStorageWriteWriterOptionsPutBqsinkLast(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := len(tt.strategy.writerOptions(table, normalized)); got != tt.want {
+			writer, err := tt.strategy.NewWriter(testClient(t), testRelation())
+			if err != nil {
+				t.Fatalf("NewWriter() error = %v", err)
+			}
+			if got := len(writer.writerOptions(normalized)); got != tt.want {
 				t.Errorf("options = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestStorageWriteNewWriterAcceptsAStreamNameMatchingRelation checks that a
+// StreamName whose table agrees with relation does not trip the mismatch check.
+func TestStorageWriteNewWriterAcceptsAStreamNameMatchingRelation(t *testing.T) {
+	t.Parallel()
+
+	strategy := &StorageWrite{StreamName: "projects/test-project/datasets/test_dataset/tables/test_table/streams/s"}
+	writer, err := strategy.NewWriter(testClient(t), testRelation())
+	if err != nil {
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	want := testRelation()
+	want.ProjectID = "test-project"
+	if got := writer.Relation(); got != want {
+		t.Errorf("Relation() = %s, want %s", got, want)
+	}
+}
+
+// TestStorageWriteNewWriterRejectsAStreamNameForAnotherTable checks that NewWriter
+// catches a StreamName belonging to a different table, rather than letting relation
+// be silently ignored the way an already-open stream's type is.
+func TestStorageWriteNewWriterRejectsAStreamNameForAnotherTable(t *testing.T) {
+	t.Parallel()
+
+	strategy := &StorageWrite{StreamName: "projects/test-project/datasets/other_dataset/tables/other_table/streams/s"}
+	_, err := strategy.NewWriter(testClient(t), testRelation())
+	if err == nil {
+		t.Fatal("NewWriter() error = nil, want a rejection of a StreamName belonging to another table")
+	}
+	if !strings.Contains(err.Error(), "test-project.other_dataset.other_table") {
+		t.Errorf("NewWriter() error = %v, want it to name the table the StreamName belongs to", err)
 	}
 }
 
@@ -271,5 +308,32 @@ func TestJSONColumnRejectsInvalidText(t *testing.T) {
 	}
 	if _, err := encodeJSONRow(map[string]bigquery.Value{"doc": 42}, schema); err == nil {
 		t.Error("encodeJSONRow() error = nil, want a rejection of a non-text value")
+	}
+}
+
+// TestStorageWriteNewWriterRejectsAMalformedStreamName covers the other way the
+// StreamName check can fail: a name that is not a stream name at all, which would
+// otherwise be compared against the relation as if it were one.
+func TestStorageWriteNewWriterRejectsAMalformedStreamName(t *testing.T) {
+	t.Parallel()
+
+	names := []string{
+		"not-a-stream-name",
+		"projects/p/datasets/d",
+		"proj/p/datasets/d/tables/t/streams/s",
+		"/////",
+	}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := (&StorageWrite{StreamName: name}).NewWriter(testClient(t), testRelation())
+			if err == nil {
+				t.Fatalf("NewWriter() error = nil for StreamName %q, want it refused", name)
+			}
+			if !strings.Contains(err.Error(), name) {
+				t.Errorf("NewWriter() error = %v, want it to name the stream it could not read", err)
+			}
+		})
 	}
 }

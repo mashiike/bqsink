@@ -137,6 +137,17 @@ func readRowsOnce(t *testing.T, client *bigquery.Client, relation Relation) []ma
 	}
 }
 
+// closeWriter arranges for w to be closed once the test finishes, so that a
+// Storage Write API stream or an unsent load job batch never leaks past it.
+func closeWriter(t *testing.T, w RowsWriter) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := w.Close(context.Background()); err != nil {
+			t.Errorf("writer Close() error = %v", err)
+		}
+	})
+}
+
 type integrationRow struct {
 	ID     string            `bqsink:"id,required"`
 	Count  int64             `bqsink:"count"`
@@ -253,19 +264,20 @@ func TestIntegrationLoadJobs(t *testing.T) {
 	ensureDataset(t, client, datasetID)
 	relation := integrationRelation(t, client, projectID, datasetID)
 
-	s, err := New[integrationRow](client, relation,
+	w, err := (&LoadJobs{}).NewWriter(client, relation)
+	if err != nil {
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	closeWriter(t, w)
+	s, err := NewSinker(w, DeclarationOf[integrationRow](),
 		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
-		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewSinker() error = %v", err)
 	}
 	ctx := context.Background()
 	if _, err := s.Sink(ctx, sampleIntegrationRow("load")); err != nil {
 		t.Fatalf("Sink() error = %v", err)
-	}
-	if err := s.Close(ctx); err != nil {
-		t.Fatalf("Close() error = %v", err)
 	}
 
 	rows := readRows(t, client, relation, 1)
@@ -283,19 +295,20 @@ func TestIntegrationStorageWrite(t *testing.T) {
 	ensureDataset(t, client, datasetID)
 	relation := integrationRelation(t, client, projectID, datasetID)
 
-	s, err := New[integrationRow](client, relation,
+	w, err := (&StorageWrite{}).NewWriter(client, relation)
+	if err != nil {
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	closeWriter(t, w)
+	s, err := NewSinker(w, DeclarationOf[integrationRow](),
 		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
-		WithWriteStrategy(&StorageWrite{}),
 	)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewSinker() error = %v", err)
 	}
 	ctx := context.Background()
 	if _, err := s.Sink(ctx, sampleIntegrationRow("storage")); err != nil {
 		t.Fatalf("Sink() error = %v", err)
-	}
-	if err := s.Close(ctx); err != nil {
-		t.Fatalf("Close() error = %v", err)
 	}
 
 	rows := readRows(t, client, relation, 1)
@@ -321,26 +334,32 @@ func TestIntegrationLoadJobWithANarrowerSchema(t *testing.T) {
 	relation := integrationRelation(t, client, projectID, datasetID)
 
 	ctx := context.Background()
-	wide, err := New[integrationRow](client, relation,
+	wideWriter, err := (&LoadJobs{}).NewWriter(client, relation)
+	if err != nil {
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	closeWriter(t, wideWriter)
+	wide, err := NewSinker(wideWriter, DeclarationOf[integrationRow](),
 		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
-		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewSinker() error = %v", err)
 	}
-	if err := wide.Migrate(ctx); err != nil {
-		t.Fatalf("Migrate() error = %v", err)
+	if err := wide.start(ctx); err != nil {
+		t.Fatalf("start() error = %v", err)
 	}
 
-	narrow, err := New[narrowRow](client, relation, WithWriteStrategy(&LoadJobs{}))
+	narrowWriter, err := (&LoadJobs{}).NewWriter(client, relation)
 	if err != nil {
-		t.Fatalf("New() for the narrow row error = %v", err)
+		t.Fatalf("NewWriter() for the narrow row error = %v", err)
+	}
+	closeWriter(t, narrowWriter)
+	narrow, err := NewSinker(narrowWriter, DeclarationOf[narrowRow]())
+	if err != nil {
+		t.Fatalf("NewSinker() for the narrow row error = %v", err)
 	}
 	if _, err := narrow.Sink(ctx, narrowRow{ID: "narrow", Count: 1}); err != nil {
-		t.Fatalf("Sink() error = %v", err)
-	}
-	if err := narrow.Close(ctx); err != nil {
-		t.Fatalf("Close() error = %v; a load job whose schema is narrower than the table was rejected", err)
+		t.Fatalf("Sink() error = %v; a load job whose schema is narrower than the table was rejected", err)
 	}
 
 	rows := readRows(t, client, relation, 1)
@@ -372,26 +391,34 @@ func TestIntegrationAppendNewColumns(t *testing.T) {
 	relation := integrationRelation(t, client, projectID, datasetID)
 
 	ctx := context.Background()
-	before, err := New[narrowRow](client, relation,
+	beforeWriter, err := (&LoadJobs{}).NewWriter(client, relation)
+	if err != nil {
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	closeWriter(t, beforeWriter)
+	before, err := NewSinker(beforeWriter, DeclarationOf[narrowRow](),
 		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
-		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewSinker() error = %v", err)
 	}
-	if err := before.Migrate(ctx); err != nil {
-		t.Fatalf("Migrate() error = %v", err)
+	if err := before.start(ctx); err != nil {
+		t.Fatalf("start() error = %v", err)
 	}
 
-	after, err := New[grownRow](client, relation,
+	afterWriter, err := (&LoadJobs{}).NewWriter(client, relation)
+	if err != nil {
+		t.Fatalf("NewWriter() for the grown row error = %v", err)
+	}
+	closeWriter(t, afterWriter)
+	after, err := NewSinker(afterWriter, DeclarationOf[grownRow](),
 		WithMigrationStrategy(AppendNewColumns{}, nil),
-		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
-		t.Fatalf("New() for the grown row error = %v", err)
+		t.Fatalf("NewSinker() for the grown row error = %v", err)
 	}
-	if err := after.Migrate(ctx); err != nil {
-		t.Fatalf("Migrate() error = %v; the column was not added", err)
+	if err := after.start(ctx); err != nil {
+		t.Fatalf("start() error = %v; the column was not added", err)
 	}
 
 	md, err := relation.table(client).Metadata(ctx)
@@ -414,9 +441,6 @@ func TestIntegrationAppendNewColumns(t *testing.T) {
 	if _, err := after.Sink(ctx, grownRow{ID: "grown", Count: 2, Extra: "e"}); err != nil {
 		t.Fatalf("Sink() error = %v", err)
 	}
-	if err := after.Close(ctx); err != nil {
-		t.Fatalf("Close() error = %v", err)
-	}
 	rows := readRows(t, client, relation, 1)
 	if len(rows) != 1 {
 		t.Fatalf("read %d row(s), want 1", len(rows))
@@ -435,26 +459,34 @@ func TestIntegrationSyncAllColumnsDropsAColumn(t *testing.T) {
 	relation := integrationRelation(t, client, projectID, datasetID)
 
 	ctx := context.Background()
-	wide, err := New[grownRow](client, relation,
+	wideWriter, err := (&LoadJobs{}).NewWriter(client, relation)
+	if err != nil {
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	closeWriter(t, wideWriter)
+	wide, err := NewSinker(wideWriter, DeclarationOf[grownRow](),
 		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
-		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewSinker() error = %v", err)
 	}
-	if err := wide.Migrate(ctx); err != nil {
-		t.Fatalf("Migrate() error = %v", err)
+	if err := wide.start(ctx); err != nil {
+		t.Fatalf("start() error = %v", err)
 	}
 
-	narrow, err := New[narrowRow](client, relation,
+	narrowWriter, err := (&LoadJobs{}).NewWriter(client, relation)
+	if err != nil {
+		t.Fatalf("NewWriter() for the narrow row error = %v", err)
+	}
+	closeWriter(t, narrowWriter)
+	narrow, err := NewSinker(narrowWriter, DeclarationOf[narrowRow](),
 		WithMigrationStrategy(SyncAllColumns{}, nil),
-		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
-		t.Fatalf("New() for the narrow row error = %v", err)
+		t.Fatalf("NewSinker() for the narrow row error = %v", err)
 	}
-	if err := narrow.Migrate(ctx); err != nil {
-		t.Fatalf("Migrate() error = %v; the DDL did not run", err)
+	if err := narrow.start(ctx); err != nil {
+		t.Fatalf("start() error = %v; the DDL did not run", err)
 	}
 
 	md, err := relation.table(client).Metadata(ctx)
@@ -477,26 +509,34 @@ func TestIntegrationIgnoreColumnsKeepsAColumn(t *testing.T) {
 	relation := integrationRelation(t, client, projectID, datasetID)
 
 	ctx := context.Background()
-	wide, err := New[grownRow](client, relation,
+	wideWriter, err := (&LoadJobs{}).NewWriter(client, relation)
+	if err != nil {
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	closeWriter(t, wideWriter)
+	wide, err := NewSinker(wideWriter, DeclarationOf[grownRow](),
 		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
-		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewSinker() error = %v", err)
 	}
-	if err := wide.Migrate(ctx); err != nil {
-		t.Fatalf("Migrate() error = %v", err)
+	if err := wide.start(ctx); err != nil {
+		t.Fatalf("start() error = %v", err)
 	}
 
-	narrow, err := New[narrowRow](client, relation,
+	narrowWriter, err := (&LoadJobs{}).NewWriter(client, relation)
+	if err != nil {
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	closeWriter(t, narrowWriter)
+	narrow, err := NewSinker(narrowWriter, DeclarationOf[narrowRow](),
 		WithMigrationStrategy(SyncAllColumns{IgnoreColumns: []string{"extra"}}, nil),
-		WithWriteStrategy(&LoadJobs{}),
 	)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewSinker() error = %v", err)
 	}
-	if err := narrow.Migrate(ctx); err != nil {
-		t.Fatalf("Migrate() error = %v", err)
+	if err := narrow.start(ctx); err != nil {
+		t.Fatalf("start() error = %v", err)
 	}
 
 	md, err := relation.table(client).Metadata(ctx)
@@ -526,15 +566,17 @@ func TestIntegrationMissingTableIsReported(t *testing.T) {
 
 	// The default strategy creates a missing table, so this needs MigrationNone to
 	// reach ErrTableMissing at all.
-	s, err := New[narrowRow](client, relation,
-		WithMigrationStrategy(MigrationNone{}, nil),
-		WithWriteStrategy(&LoadJobs{}),
-	)
+	w, err := (&LoadJobs{}).NewWriter(client, relation)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewWriter() error = %v", err)
 	}
-	if err := s.Migrate(context.Background()); !errors.Is(err, ErrTableMissing) {
-		t.Errorf("Migrate() error = %v, want one wrapping ErrTableMissing", err)
+	closeWriter(t, w)
+	s, err := NewSinker(w, DeclarationOf[narrowRow](), WithMigrationStrategy(MigrationNone{}, nil))
+	if err != nil {
+		t.Fatalf("NewSinker() error = %v", err)
+	}
+	if err := s.start(context.Background()); !errors.Is(err, ErrTableMissing) {
+		t.Errorf("start() error = %v, want one wrapping ErrTableMissing", err)
 	}
 }
 
@@ -577,18 +619,19 @@ func TestIntegrationLoadJobsThroughCloudStorage(t *testing.T) {
 		Bucket: bucket,
 		Prefix: "bqsink-integration",
 	}
-	s, err := New[integrationRow](client, relation,
+	w, err := (&LoadJobs{Staging: staging}).NewWriter(client, relation)
+	if err != nil {
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	closeWriter(t, w)
+	s, err := NewSinker(w, DeclarationOf[integrationRow](),
 		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
-		WithWriteStrategy(&LoadJobs{Staging: staging}),
 	)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewSinker() error = %v", err)
 	}
 	if _, err := s.Sink(ctx, sampleIntegrationRow("staged")); err != nil {
 		t.Fatalf("Sink() error = %v", err)
-	}
-	if err := s.Close(ctx); err != nil {
-		t.Fatalf("Close() error = %v", err)
 	}
 
 	rows := readRows(t, client, relation, 1)
@@ -620,18 +663,19 @@ func TestIntegrationStagedObjectIsRemoved(t *testing.T) {
 
 	prefix := fmt.Sprintf("bqsink-cleanup-%d", time.Now().UnixNano())
 	staging := &bqgcs.Staging{Client: gcs, Bucket: bucket, Prefix: prefix}
-	s, err := New[narrowRow](client, relation,
+	w, err := (&LoadJobs{Staging: staging}).NewWriter(client, relation)
+	if err != nil {
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	closeWriter(t, w)
+	s, err := NewSinker(w, DeclarationOf[narrowRow](),
 		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
-		WithWriteStrategy(&LoadJobs{Staging: staging}),
 	)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewSinker() error = %v", err)
 	}
 	if _, err := s.Sink(ctx, narrowRow{ID: "staged", Count: 1}); err != nil {
 		t.Fatalf("Sink() error = %v", err)
-	}
-	if err := s.Close(ctx); err != nil {
-		t.Fatalf("Close() error = %v", err)
 	}
 
 	it := gcs.Bucket(bucket).Objects(ctx, &storage.Query{Prefix: prefix})
@@ -695,18 +739,19 @@ func TestIntegrationStagedObjectIsKept(t *testing.T) {
 	})
 
 	staging := &bqgcs.Staging{Client: gcs, Bucket: bucket, Prefix: prefix, Keep: true}
-	s, err := New[narrowRow](client, relation,
+	w, err := (&LoadJobs{Staging: staging}).NewWriter(client, relation)
+	if err != nil {
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	closeWriter(t, w)
+	s, err := NewSinker(w, DeclarationOf[narrowRow](),
 		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
-		WithWriteStrategy(&LoadJobs{Staging: staging}),
 	)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewSinker() error = %v", err)
 	}
 	if _, err := s.Sink(ctx, narrowRow{ID: "kept", Count: 1}); err != nil {
 		t.Fatalf("Sink() error = %v", err)
-	}
-	if err := s.Close(ctx); err != nil {
-		t.Fatalf("Close() error = %v", err)
 	}
 
 	it := gcs.Bucket(bucket).Objects(ctx, &storage.Query{Prefix: prefix})
@@ -740,15 +785,17 @@ func TestIntegrationIngestionMetadata(t *testing.T) {
 	relation := integrationRelation(t, client, projectID, datasetID)
 
 	ctx := context.Background()
-	s, err := New[metadataIntegrationRow](client, relation, WithWriteStrategy(&LoadJobs{}))
+	w, err := (&LoadJobs{}).NewWriter(client, relation)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	closeWriter(t, w)
+	s, err := NewSinker(w, DeclarationOf[metadataIntegrationRow]())
+	if err != nil {
+		t.Fatalf("NewSinker() error = %v", err)
 	}
 	if _, err := s.Sink(ctx, metadataIntegrationRow{ID: "with-metadata"}); err != nil {
 		t.Fatalf("Sink() error = %v; BigQuery may have rejected the underscore-prefixed columns", err)
-	}
-	if err := s.Close(ctx); err != nil {
-		t.Fatalf("Close() error = %v", err)
 	}
 
 	md, err := relation.table(client).Metadata(ctx)
@@ -825,11 +872,21 @@ func TestIntegrationTimeColumnOptions(t *testing.T) {
 	}
 
 	tests := []struct {
-		name     string
-		strategy WriteStrategy
+		name      string
+		newWriter func(*bigquery.Client, Relation) (RowsWriter, error)
 	}{
-		{name: "LoadJobs", strategy: &LoadJobs{}},
-		{name: "StorageWrite", strategy: &StorageWrite{}},
+		{
+			name: "LoadJobs",
+			newWriter: func(c *bigquery.Client, r Relation) (RowsWriter, error) {
+				return (&LoadJobs{}).NewWriter(c, r)
+			},
+		},
+		{
+			name: "StorageWrite",
+			newWriter: func(c *bigquery.Client, r Relation) (RowsWriter, error) {
+				return (&StorageWrite{}).NewWriter(c, r)
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -840,17 +897,19 @@ func TestIntegrationTimeColumnOptions(t *testing.T) {
 			ensureDataset(t, client, datasetID)
 			relation := integrationRelation(t, client, projectID, datasetID)
 
-			s, err := New[timeColumnIntegrationRow](client, relation, WithWriteStrategy(tt.strategy))
+			w, err := tt.newWriter(client, relation)
 			if err != nil {
-				t.Fatalf("New() error = %v", err)
+				t.Fatalf("NewWriter() error = %v", err)
+			}
+			closeWriter(t, w)
+			s, err := NewSinker(w, DeclarationOf[timeColumnIntegrationRow]())
+			if err != nil {
+				t.Fatalf("NewSinker() error = %v", err)
 			}
 			ctx := context.Background()
 			row := timeColumnIntegrationRow{ID: tt.name, At: at, OnDay: at, LocalAt: at, OpenAt: at}
 			if _, err := s.Sink(ctx, row); err != nil {
 				t.Fatalf("Sink() error = %v", err)
-			}
-			if err := s.Close(ctx); err != nil {
-				t.Fatalf("Close() error = %v", err)
 			}
 
 			md, err := relation.table(client).Metadata(ctx)
@@ -892,12 +951,17 @@ func TestIntegrationTaggedLayout(t *testing.T) {
 	relation := integrationRelation(t, client, projectID, datasetID)
 
 	ctx := context.Background()
-	s, err := New[layoutIntegrationRow](client, relation, WithWriteStrategy(&LoadJobs{}))
+	w, err := (&LoadJobs{}).NewWriter(client, relation)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewWriter() error = %v", err)
 	}
-	if err := s.Migrate(ctx); err != nil {
-		t.Fatalf("Migrate() error = %v; BigQuery may have rejected the tagged layout", err)
+	closeWriter(t, w)
+	s, err := NewSinker(w, DeclarationOf[layoutIntegrationRow]())
+	if err != nil {
+		t.Fatalf("NewSinker() error = %v", err)
+	}
+	if err := s.start(ctx); err != nil {
+		t.Fatalf("start() error = %v; BigQuery may have rejected the tagged layout", err)
 	}
 
 	md, err := relation.table(client).Metadata(ctx)
@@ -936,5 +1000,82 @@ func TestIntegrationTaggedLayout(t *testing.T) {
 	wantLabels := map[string]string{"purpose": "bqsink-integration", "empty": ""}
 	if !reflect.DeepEqual(md.Labels, wantLabels) {
 		t.Errorf("labels = %v, want %v", md.Labels, wantLabels)
+	}
+}
+
+// flushRowsIntegrationRow is written one row at a time to check that
+// LoadJobs.FlushRows still delivers every row, including the ones Flush and
+// Close send on the writer's own initiative.
+type flushRowsIntegrationRow struct {
+	ID  string `bqsink:"id,required"`
+	Seq int64  `bqsink:"seq"`
+}
+
+// TestIntegrationLoadJobsFlushRows checks that FlushRows does not drop a row.
+//
+// Sink itself waits on its WriteResult synchronously, so a single goroutine
+// calling it one row at a time submits each row's own batch before another
+// can join it: FlushRows never gathers anything across Sink calls. To
+// actually hold rows under the threshold, and so exercise Flush and Close
+// sending what was held, this test writes the buffered rows through the
+// writer directly and does not wait on their WriteResult, which is what a
+// caller gathering rows itself would do.
+//
+// It does not check how many load jobs ran: that would be a claim about job
+// counts this setup cannot make honestly.
+func TestIntegrationLoadJobsFlushRows(t *testing.T) {
+	t.Parallel()
+
+	projectID, datasetID := integrationTarget(t)
+	client := integrationClient(t, projectID)
+	ensureDataset(t, client, datasetID)
+	relation := integrationRelation(t, client, projectID, datasetID)
+
+	w, err := (&LoadJobs{FlushRows: 3}).NewWriter(client, relation)
+	if err != nil {
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	closeWriter(t, w)
+	s, err := NewSinker(w, DeclarationOf[flushRowsIntegrationRow](),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
+	)
+	if err != nil {
+		t.Fatalf("NewSinker() error = %v", err)
+	}
+
+	ctx := context.Background()
+	if _, err := s.Sink(ctx, flushRowsIntegrationRow{ID: "flush-0", Seq: 0}); err != nil {
+		t.Fatalf("Sink() error = %v", err)
+	}
+
+	for _, seq := range []int64{1, 2} {
+		row, err := s.prepare(ctx, reflect.ValueOf(flushRowsIntegrationRow{ID: fmt.Sprintf("flush-%d", seq), Seq: seq}))
+		if err != nil {
+			t.Fatalf("prepare() row %d error = %v", seq, err)
+		}
+		if _, err := w.WriteRows(ctx, []Row{row}); err != nil {
+			t.Fatalf("WriteRows() row %d error = %v", seq, err)
+		}
+	}
+	if err := w.Flush(ctx); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+	if rows := readRows(t, client, relation, 3); len(rows) != 3 {
+		t.Fatalf("read %d row(s) after Flush(), want 3; Flush must send what FlushRows was holding", len(rows))
+	}
+
+	row, err := s.prepare(ctx, reflect.ValueOf(flushRowsIntegrationRow{ID: "flush-3", Seq: 3}))
+	if err != nil {
+		t.Fatalf("prepare() error = %v", err)
+	}
+	if _, err := w.WriteRows(ctx, []Row{row}); err != nil {
+		t.Fatalf("WriteRows() error = %v", err)
+	}
+	if err := w.Close(ctx); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if rows := readRows(t, client, relation, 4); len(rows) != 4 {
+		t.Fatalf("read %d row(s) after Close(), want 4; Close must send what FlushRows was holding", len(rows))
 	}
 }

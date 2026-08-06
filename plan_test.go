@@ -47,11 +47,11 @@ type everythingRow struct {
 	hidden   string
 }
 
-func everythingSinker(t *testing.T) *Sinker[everythingRow] {
+func everythingSinker(t *testing.T) *Sinker {
 	t.Helper()
-	s, err := New[everythingRow](testClient(t), testRelation(), WithMarshalers(jsonMarshalers()))
+	s, err := testSinker[everythingRow](t, WithMarshalers(jsonMarshalers()))
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
 	return s
 }
@@ -63,13 +63,13 @@ func TestRowKeysMatchTheSchema(t *testing.T) {
 	t.Parallel()
 
 	s := everythingSinker(t)
-	row, err := s.toRow(everythingRow{})
+	row, err := s.plan.marshalRow(reflect.ValueOf(everythingRow{}))
 	if err != nil {
-		t.Fatalf("toRow() error = %v", err)
+		t.Fatalf("marshalRow() error = %v", err)
 	}
 
 	var want []string
-	for _, f := range s.Schema() {
+	for _, f := range s.schema {
 		want = append(want, f.Name)
 	}
 	var got []string
@@ -94,14 +94,14 @@ type timeColumnRow struct {
 func TestTimeColumnOptionsDropAComponent(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[timeColumnRow](testClient(t), testRelation())
+	s, err := testSinker[timeColumnRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
 	at := time.Date(2026, 7, 28, 22, 30, 15, 500, time.UTC)
-	row, err := s.toRow(timeColumnRow{At: at, OnDay: at, LocalAt: at, OpenAt: at})
+	row, err := s.plan.marshalRow(reflect.ValueOf(timeColumnRow{At: at, OnDay: at, LocalAt: at, OpenAt: at}))
 	if err != nil {
-		t.Fatalf("toRow() error = %v", err)
+		t.Fatalf("marshalRow() error = %v", err)
 	}
 	day := civil.Date{Year: 2026, Month: time.July, Day: 28}
 	clock := civil.Time{Hour: 22, Minute: 30, Second: 15, Nanosecond: 500}
@@ -112,16 +112,16 @@ func TestTimeColumnOptionsDropAComponent(t *testing.T) {
 		"open_at":  clock,
 	}
 	if !reflect.DeepEqual(row, want) {
-		t.Errorf("toRow() = %#v, want %#v", row, want)
+		t.Errorf("marshalRow() = %#v, want %#v", row, want)
 	}
 }
 
 func TestTimeColumnsReadTheValuesLocation(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[timeColumnRow](testClient(t), testRelation())
+	s, err := testSinker[timeColumnRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
 	// 22:30 UTC on the 28th is 07:30 the next morning in Tokyo, so the calendar a
 	// column records follows the location the caller hands over. That is why there
@@ -140,9 +140,9 @@ func TestTimeColumnsReadTheValuesLocation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			row, err := s.toRow(timeColumnRow{OnDay: tt.at})
+			row, err := s.plan.marshalRow(reflect.ValueOf(timeColumnRow{OnDay: tt.at}))
 			if err != nil {
-				t.Fatalf("toRow() error = %v", err)
+				t.Fatalf("marshalRow() error = %v", err)
 			}
 			if got := row["on_day"]; got != bigquery.Value(tt.want) {
 				t.Errorf("on_day = %v, want %v", got, tt.want)
@@ -160,15 +160,15 @@ type repeatedTimeColumnRow struct {
 func TestTimeColumnOptionsReachThroughSlicesAndPointers(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[repeatedTimeColumnRow](testClient(t), testRelation())
+	s, err := testSinker[repeatedTimeColumnRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
 	first := time.Date(2026, 7, 28, 1, 0, 0, 0, time.UTC)
 	second := time.Date(2026, 7, 29, 23, 0, 0, 0, time.UTC)
-	row, err := s.toRow(repeatedTimeColumnRow{Days: []time.Time{first, second}, DayPtr: &first})
+	row, err := s.plan.marshalRow(reflect.ValueOf(repeatedTimeColumnRow{Days: []time.Time{first, second}, DayPtr: &first}))
 	if err != nil {
-		t.Fatalf("toRow() error = %v", err)
+		t.Fatalf("marshalRow() error = %v", err)
 	}
 	want := map[string]bigquery.Value{
 		"days": []bigquery.Value{
@@ -178,7 +178,7 @@ func TestTimeColumnOptionsReachThroughSlicesAndPointers(t *testing.T) {
 		"day_ptr": civil.Date{Year: 2026, Month: time.July, Day: 28},
 	}
 	if !reflect.DeepEqual(row, want) {
-		t.Errorf("toRow() = %#v, want %#v", row, want)
+		t.Errorf("marshalRow() = %#v, want %#v", row, want)
 	}
 }
 
@@ -194,13 +194,13 @@ type zeroTimeColumnRow struct {
 func TestZeroTimeInADateColumn(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[zeroTimeColumnRow](testClient(t), testRelation())
+	s, err := testSinker[zeroTimeColumnRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
-	row, err := s.toRow(zeroTimeColumnRow{})
+	row, err := s.plan.marshalRow(reflect.ValueOf(zeroTimeColumnRow{}))
 	if err != nil {
-		t.Fatalf("toRow() error = %v", err)
+		t.Fatalf("marshalRow() error = %v", err)
 	}
 	want := map[string]bigquery.Value{
 		"kept":    civil.Date{Year: 1, Month: time.January, Day: 1},
@@ -208,7 +208,7 @@ func TestZeroTimeInADateColumn(t *testing.T) {
 		"missing": nil,
 	}
 	if !reflect.DeepEqual(row, want) {
-		t.Errorf("toRow() = %#v, want %#v", row, want)
+		t.Errorf("marshalRow() = %#v, want %#v", row, want)
 	}
 }
 
@@ -328,8 +328,8 @@ func TestSchemaOfEverythingRow(t *testing.T) {
 		{Name: "declared", Type: bigquery.JSONFieldType},
 		{Name: "external", Type: bigquery.JSONFieldType},
 	}
-	if !reflect.DeepEqual(s.Schema(), want) {
-		t.Errorf("Schema() mismatch\n got: %s\nwant: %s", formatSchema(s.Schema()), formatSchema(want))
+	if !reflect.DeepEqual(s.schema, want) {
+		t.Errorf("schema mismatch\n got: %s\nwant: %s", formatSchema(s.schema), formatSchema(want))
 	}
 }
 
@@ -340,7 +340,7 @@ func TestToRowValues(t *testing.T) {
 	str := "pointed at"
 	at := time.Date(2026, 7, 28, 12, 30, 0, 0, time.UTC)
 	money := big.NewRat(25, 2)
-	row, err := s.toRow(everythingRow{
+	row, err := s.plan.marshalRow(reflect.ValueOf(everythingRow{
 		Str:      "plain",
 		Req:      "needed",
 		Nullable: &str,
@@ -362,9 +362,9 @@ func TestToRowValues(t *testing.T) {
 		Declared: payload{Data: map[string]string{"k": "v"}},
 		External: external{Amount: "12.5"},
 		Skipped:  "dropped",
-	})
+	}))
 	if err != nil {
-		t.Fatalf("toRow() error = %v", err)
+		t.Fatalf("marshalRow() error = %v", err)
 	}
 
 	tests := []struct {
@@ -459,9 +459,9 @@ func TestToRowNullHandling(t *testing.T) {
 	t.Parallel()
 
 	s := everythingSinker(t)
-	row, err := s.toRow(everythingRow{})
+	row, err := s.plan.marshalRow(reflect.ValueOf(everythingRow{}))
 	if err != nil {
-		t.Fatalf("toRow() error = %v", err)
+		t.Fatalf("marshalRow() error = %v", err)
 	}
 
 	tests := []struct {
@@ -531,16 +531,16 @@ type repeatedNullIfZeroRow struct {
 func TestNullIfZeroUsesIsZero(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[zeroTimeRow](testClient(t), testRelation())
+	s, err := testSinker[zeroTimeRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
 
 	t.Run("a zero time and a zero number become NULL", func(t *testing.T) {
 		t.Parallel()
-		row, err := s.toRow(zeroTimeRow{})
+		row, err := s.plan.marshalRow(reflect.ValueOf(zeroTimeRow{}))
 		if err != nil {
-			t.Fatalf("toRow() error = %v", err)
+			t.Fatalf("marshalRow() error = %v", err)
 		}
 		for _, column := range []string{"at", "at_ptr", "num"} {
 			if got := row[column]; got != nil {
@@ -552,9 +552,9 @@ func TestNullIfZeroUsesIsZero(t *testing.T) {
 	t.Run("set values survive", func(t *testing.T) {
 		t.Parallel()
 		at := time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC)
-		row, err := s.toRow(zeroTimeRow{At: at, AtPtr: &at, Num: 5})
+		row, err := s.plan.marshalRow(reflect.ValueOf(zeroTimeRow{At: at, AtPtr: &at, Num: 5}))
 		if err != nil {
-			t.Fatalf("toRow() error = %v", err)
+			t.Fatalf("marshalRow() error = %v", err)
 		}
 		if got := row["at"]; got != at {
 			t.Errorf("row[at] = %#v, want %v", got, at)
@@ -571,9 +571,9 @@ func TestNullIfZeroUsesIsZero(t *testing.T) {
 func TestNullIfZeroOnARepeatedColumn(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[repeatedNullIfZeroRow](testClient(t), testRelation())
+	s, err := testSinker[repeatedNullIfZeroRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
 
 	tests := []struct {
@@ -588,9 +588,9 @@ func TestNullIfZeroOnARepeatedColumn(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			row, err := s.toRow(repeatedNullIfZeroRow{Tags: tt.tags})
+			row, err := s.plan.marshalRow(reflect.ValueOf(repeatedNullIfZeroRow{Tags: tt.tags}))
 			if err != nil {
-				t.Fatalf("toRow() error = %v", err)
+				t.Fatalf("marshalRow() error = %v", err)
 			}
 			if got := row["tags"]; got != tt.want {
 				t.Errorf("row[tags] = %#v, want %#v", got, tt.want)
@@ -600,9 +600,9 @@ func TestNullIfZeroOnARepeatedColumn(t *testing.T) {
 
 	t.Run("a non-empty slice survives", func(t *testing.T) {
 		t.Parallel()
-		row, err := s.toRow(repeatedNullIfZeroRow{Tags: []string{"x"}})
+		row, err := s.plan.marshalRow(reflect.ValueOf(repeatedNullIfZeroRow{Tags: []string{"x"}}))
 		if err != nil {
-			t.Fatalf("toRow() error = %v", err)
+			t.Fatalf("marshalRow() error = %v", err)
 		}
 		if got := row["tags"]; !reflect.DeepEqual(got, []bigquery.Value{"x"}) {
 			t.Errorf("row[tags] = %#v, want [x]", got)
@@ -613,29 +613,29 @@ func TestNullIfZeroOnARepeatedColumn(t *testing.T) {
 func TestToRowFollowsPointerTypeParameter(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[*nestedRow](testClient(t), testRelation())
+	s, err := testSinker[*nestedRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
-	row, err := s.toRow(&nestedRow{A: "a", B: 7})
+	row, err := s.plan.marshalRow(reflect.ValueOf(&nestedRow{A: "a", B: 7}))
 	if err != nil {
-		t.Fatalf("toRow() error = %v", err)
+		t.Fatalf("marshalRow() error = %v", err)
 	}
 	want := map[string]bigquery.Value{"A": "a", "B": int64(7)}
 	if !reflect.DeepEqual(row, want) {
-		t.Errorf("toRow() = %#v, want %#v", row, want)
+		t.Errorf("marshalRow() = %#v, want %#v", row, want)
 	}
 }
 
 func TestToRowRejectsANilRow(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[*nestedRow](testClient(t), testRelation())
+	s, err := testSinker[*nestedRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
-	if _, err := s.toRow(nil); err == nil {
-		t.Fatal("toRow(nil) error = nil, want a rejection")
+	if _, err := s.plan.marshalRow(reflect.ValueOf(nil)); err == nil {
+		t.Fatal("marshalRow(nil) error = nil, want a rejection")
 	}
 }
 
@@ -655,16 +655,16 @@ func (failingValue) MarshalBigQueryValue() (bigquery.Value, error) { return nil,
 func TestToRowPropagatesMarshalErrors(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[failingMarshalRow](testClient(t), testRelation())
+	s, err := testSinker[failingMarshalRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
-	if _, err := s.toRow(failingMarshalRow{}); !errors.Is(err, errMarshalFailed) {
-		t.Errorf("toRow() error = %v, want one wrapping the marshaler's failure", err)
+	if _, err := s.plan.marshalRow(reflect.ValueOf(failingMarshalRow{})); !errors.Is(err, errMarshalFailed) {
+		t.Errorf("marshalRow() error = %v, want one wrapping the marshaler's failure", err)
 	}
 }
 
-func TestSinkWritesThroughTheWriteStrategy(t *testing.T) {
+func TestSinkWritesThroughTheWriter(t *testing.T) {
 	t.Parallel()
 
 	fake := &fakeTable{metadata: &bigquery.TableMetadata{
@@ -674,23 +674,17 @@ func TestSinkWritesThroughTheWriteStrategy(t *testing.T) {
 			{Name: "B", Type: bigquery.IntegerFieldType},
 		},
 	}}
-	writer := &fakeRowWriter{}
-	s := newTestSinker[nestedRow](t, fake,
-		WithMigrationStrategy(AppendNewColumns{}, nil),
-		WithWriteStrategy(&fakeWriteStrategy{writer: writer}),
-	)
+	writer := newFakeWriter(t)
+	s := newTestSinker[nestedRow](t, fake, writer, WithMigrationStrategy(AppendNewColumns{}, nil))
 
 	ctx := t.Context()
 	if _, err := s.Sink(ctx, nestedRow{A: "one", B: 1}); err != nil {
 		t.Fatalf("Sink() error = %v", err)
 	}
-	if n, err := s.Sink(ctx, nestedRow{A: "two", B: 2}, nestedRow{A: "three", B: 3}); err != nil {
+	if n, err := s.Sink(ctx, []nestedRow{{A: "two", B: 2}, {A: "three", B: 3}}); err != nil {
 		t.Fatalf("Sink() error = %v", err)
 	} else if n != 2 {
 		t.Errorf("Sink() n = %d, want 2", n)
-	}
-	if err := s.Close(ctx); err != nil {
-		t.Fatalf("Close() error = %v", err)
 	}
 
 	want := []map[string]bigquery.Value{
@@ -698,17 +692,17 @@ func TestSinkWritesThroughTheWriteStrategy(t *testing.T) {
 		{"A": "two", "B": int64(2)},
 		{"A": "three", "B": int64(3)},
 	}
-	if !reflect.DeepEqual(writer.rows, want) {
-		t.Errorf("appended rows = %#v, want %#v", writer.rows, want)
+	if got := appendedRows(writer); !reflect.DeepEqual(got, want) {
+		t.Errorf("appended rows = %#v, want %#v", got, want)
 	}
-	if writer.closes != 1 {
-		t.Errorf("Close was called %d times, want 1", writer.closes)
+	writer.mu.Lock()
+	binds, boundSchema := writer.binds, writer.boundSchema
+	writer.mu.Unlock()
+	if binds != 1 {
+		t.Errorf("BindSchema was called %d times, want 1; the writer must be reused", binds)
 	}
-	if writer.opens != 1 {
-		t.Errorf("Open was called %d times, want 1; the writer must be reused", writer.opens)
-	}
-	if !reflect.DeepEqual(writer.openedSchema, s.Schema()) {
-		t.Errorf("Open received %s, want the declared %s", formatSchema(writer.openedSchema), formatSchema(s.Schema()))
+	if !reflect.DeepEqual(boundSchema, s.schema) {
+		t.Errorf("BindSchema received %s, want the declared %s", formatSchema(boundSchema), formatSchema(s.schema))
 	}
 }
 
@@ -721,13 +715,13 @@ type unsignedValueRow struct {
 func TestToRowUnsignedValues(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[unsignedValueRow](testClient(t), testRelation())
+	s, err := testSinker[unsignedValueRow](t)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
-	row, err := s.toRow(unsignedValueRow{Small: 4294967295, Large: math.MaxUint64})
+	row, err := s.plan.marshalRow(reflect.ValueOf(unsignedValueRow{Small: 4294967295, Large: math.MaxUint64}))
 	if err != nil {
-		t.Fatalf("toRow() error = %v", err)
+		t.Fatalf("marshalRow() error = %v", err)
 	}
 	if got := row["small"]; got != int64(4294967295) {
 		t.Errorf("row[small] = %#v, want an int64", got)

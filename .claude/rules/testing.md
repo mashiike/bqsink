@@ -17,14 +17,16 @@ paths:
 | `table.Metadata` / `Create` / `Update` | `tableAPI` | `fakeTable` |
 | DDL（`client.Query`） | `queryRunner` | `fakeQueryRunner` |
 | ロードジョブ | `jobLoader` | `fakeLoader` |
-| 転送層全体 | `WriteStrategy` / `RowWriter` | `fakeWriteStrategy` / `flakyRowWriter` |
+| 転送層全体 | `RowsWriter` / `WriteResult` | `fakeWriter`（`newFakeWriter(t)`） |
 | GCS ステージング | `Stager` | `fakeStager` |
 
-`newTestSinker` が `api` と `query` に fake を挿し、**`WriteStrategy` にも fake を既定で入れる**（呼び出し側が渡せば上書きされる）。既定の `StorageWrite` は実接続を試みるので、この既定がないと `Sink` を呼ぶテストが GCP を叩く。
+ヘルパーは3つ。**`newTestSinker[T](t, fake *fakeTable, w RowsWriter, opts ...Option)`** が `api` と `query` に fake を挿し、**`w` に nil を渡すと `newFakeWriter(t)` を既定で入れる**。実 writer を渡すと GCP を叩くので、`Sink` を呼ぶテストは必ず fake を通す。**`testSinker[T](t, opts ...Option) (*Sinker, error)`** は宣言の解決だけを見るテスト用（fake writer 上に `NewSinker` するだけ。旧 `settledSinker` の後継）。
 
-既定の戦略が `AppendNewColumns{CreateIfMissing: true}` になったことで、**`Migrate` が成功して `Open` まで進むテストが増えた**。`ErrTableMissing` を検査したいテストは `WithMigrationStrategy(MigrationNone{})` を明示する。
+**宣言の解決が `NewSinker` に移った**ので、タグの誤り・宣言スキーマとの不一致・値レシーバの `FillRow` は**構築時のエラー**になる。以前は初回 `Sink` まで出なかった。`ErrTableMissing` のように I/O が要る検査だけが `Sink`（`start`）の側に残る。
 
-`bigquery.NewClient(ctx, "test-project", option.WithoutAuthentication())` で認証なしの client が作れる。`New` が I/O しない設計なので、構築部分はこれでテストできる。
+`fakeWriter.client` を nil にすると「BigQuery に繋がっていない writer」を作れる。**`NewSinker` は `MigrationNone` 以外の戦略をそのとき拒否する**ので、その検査のために使う。
+
+`bigquery.NewClient(ctx, "test-project", option.WithoutAuthentication())` で認証なしの client が作れる。`NewSinker` も `NewWriter` も I/O しない設計なので、構築部分はこれでテストできる。
 
 ## 疎通は統合テストでしか取れない
 

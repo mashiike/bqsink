@@ -23,7 +23,7 @@ if err != nil {
 	return err
 }
 
-s, err := bqsink.New[AccessLog](client, bqsink.Relation{
+w, err := (&bqsink.LoadJobs{}).NewWriter(client, bqsink.Relation{
 	DatasetID: "logs",
 	TableID:   "access",
 })
@@ -31,16 +31,21 @@ if err != nil {
 	return err
 }
 defer func() {
-	if cerr := s.Close(ctx); cerr != nil && err == nil {
+	if cerr := w.Close(ctx); cerr != nil && err == nil {
 		err = cerr
 	}
 }()
+
+s, err := bqsink.NewSinker(w, bqsink.DeclarationOf[AccessLog]())
+if err != nil {
+	return err
+}
 
 rows := []AccessLog{
 	{Timestamp: time.Now(), UserID: "u1", Path: "/"},
 	{Timestamp: time.Now(), UserID: "u2", Path: "/about"},
 }
-n, err := s.Sink(ctx, rows...)
+n, err := s.Sink(ctx, rows)
 if err != nil {
 	// rows[n:] never reached BigQuery. They are still yours to deal with.
 	return err
@@ -48,31 +53,64 @@ if err != nil {
 return nil
 ```
 
-`Sink` writes the rows it is given before it returns and buffers nothing between
-calls, so **the rows it is given are the batch.** It returns how many landed, and a
+Building takes two steps: a **writer** for the transport (`LoadJobs` here; see
+[Transports](#transports)), and a **Sinker** for the declaration. Closing belongs to
+the writer, since that is what holds a connection — a `Sinker` buffers nothing of
+its own to flush and so has no `Close`.
+
+`Sink` hands the rows it is given to the writer and waits for the result, so
+nothing is buffered inside the `Sinker` itself: **the rows it is given are the
+batch handed to the writer.** What the writer then does with that batch is its own
+business — `LoadJobs.FlushRows` can hold rows back across calls, for instance (see
+[Flushing rows](#flushing-rows)). `Sink` returns how many rows landed, and a
 non-nil error whenever that is fewer than it was given: `rows[n:]` are exactly the
 ones that did not make it, and nothing else records them. Give it a whole batch
 rather than one row at a time, especially with `LoadJobs`, where every call is a
-load job.
+load job unless `FlushRows` says otherwise.
+
+A slice is a batch of its elements and anything else is a single row, so `Sink(ctx,
+rows)` and `Sink(ctx, row)` are both ordinary calls. Every row in a batch has to be of
+one type, which a `[]AccessLog` gives for free and a `[]any` can break.
+
+**The row type is settled by `NewSinker`, not by the first `Sink`.** It reads the
+`Declaration` it is given and keeps it for as long as the `Sinker` lives: a later
+`Sink` handing over another type is an error, and a second type needs a `Sinker` of
+its own. Everything the declaration decides — a struct that cannot be mapped to a
+row, a column missing from a spelled out schema, a `FillRow` with a value receiver
+— is therefore reported by `NewSinker`, which talks to nothing and reads nothing.
+Nothing contacts BigQuery until the first `Sink`, which is what reconciles the real
+table with the declaration and hands the writer the settled schema.
+
+`DeclarationOf[T]()` is the ordinary way to build a `Declaration`, for a row type
+known at compile time. Where the schema is only settled at run time — a
+`reflect.StructOf` type built from a schema fetched from somewhere else, say —
+`DeclarationForType(reflect.Type)` takes the type directly. Such a type only
+promotes the *value* receiver methods of what it embeds, so embedding
+`IngestionMetadata`, whose `FillRow` has a pointer receiver, leaves it uncalled;
+`NewSinker` rejects that rather than writing empty ingestion columns.
 
 ## Options
 
-`New` takes four, and **none of them describes the table.** What the table looks
-like belongs to the row type; these settle how bqsink behaves around that.
+`NewSinker` takes three, and **none of them describes the table.** What the table
+looks like belongs to the row type, which reaches `NewSinker` as a `Declaration`;
+these settle how bqsink behaves around that instead. How rows travel is settled
+earlier still, on the writer's own constructor — see [Transports](#transports).
 
 | Option | Default | Section |
 |---|---|---|
 | `WithMigrationStrategy` | `AppendNewColumns{CreateIfMissing: true}`, four retries | [Migration](#migration) |
-| `WithWriteStrategy` | `&StorageWrite{}` | [Transports](#transports) |
 | `WithMarshalers` | no overrides | [Custom column types](#custom-column-types) |
 | `WithLogger` | records are discarded | [Logging](#logging) |
 
-A strategy is configured with a struct literal rather than more options, so that its
-settings never look like one:
+A migration strategy is configured with a struct literal rather than an option of
+its own, so that its settings never look like one:
 
 ```go
-bqsink.WithWriteStrategy(&bqsink.LoadJobs{Staging: bqgcs.Staging{Bucket: "staging"}})
+bqsink.WithMigrationStrategy(bqsink.SyncAllColumns{}, bqsink.DefaultRetryPolicy)
 ```
+
+A writer's settings take the same shape — `LoadJobs` and `StorageWrite` are struct
+literals too, configured where they are built rather than through an `Option`.
 
 ## Declaring the schema
 
@@ -190,8 +228,8 @@ func (Row) BigQueryTableMetadata() *bigquery.TableMetadata {
 The same method carries partitioning, clustering, labels and expiration, so a type
 that already has one simply adds `Schema` to it.
 
-Every column the struct would write has to be present in the schema; `New` fails
-otherwise rather than letting BigQuery reject the first write. A schema wider than
+Every column the struct would write has to be present in the schema; `NewSinker`
+fails otherwise rather than letting BigQuery reject the write. A schema wider than
 the struct is fine — the extra columns stay NULL.
 
 ### Partitioning, clustering and descriptions
@@ -215,8 +253,8 @@ type AccessLog struct {
 | `cluster` | the column's position, counting from 1; the order decides how well BigQuery can prune |
 | `description` | documents the column |
 
-`New` rejects a layout BigQuery would refuse, so a bad tag fails before the first
-write rather than at `CREATE TABLE`:
+A layout BigQuery would refuse is rejected before anything is written rather than at
+`CREATE TABLE`:
 
 - one partitioning column per table, not repeated, and TIMESTAMP, DATE or DATETIME
 - `partition:"hour"` on a DATE column — the one granularity DATE cannot carry
@@ -263,7 +301,7 @@ func (AccessLog) BigQueryTableMetadata() *bigquery.TableMetadata {
 ```
 
 Declaring the same thing both ways is an error rather than one silently winning:
-`New` fails if the metadata sets `Description`, `Labels`, `TimePartitioning`,
+`NewSinker` fails if the metadata sets `Description`, `Labels`, `TimePartitioning`,
 `RangePartitioning` or `Clustering` that a tag also settles.
 
 ### Custom column types
@@ -339,13 +377,16 @@ out for itself: the destination, the `Sinker`'s id and creation time, the row's 
 and time.
 
 It needs a **pointer receiver**; with a value receiver it would fill a copy that is
-then discarded, and `New` rejects that.
+then discarded, and `NewSinker` rejects that.
 
 ## Migration
 
-`Migrate` reads the table's state, asks the strategy what to change, and applies
-the answer. `Sink` triggers it on the first call, so calling it directly is only
-needed to apply schema changes ahead of time, such as during a deploy.
+The first `Sink` reads the table's state, asks the strategy what to change, and
+applies the answer before writing anything. There is no separate method for it:
+`NewSinker` already knows the declared schema from the `Declaration` it was given,
+and the first batch is simply the earliest point at which reconciling it with
+BigQuery becomes unavoidable — a `Sinker` with no rows to write has nothing to
+reconcile.
 
 | Strategy | Behaviour |
 |---|---|
@@ -359,7 +400,7 @@ So the example above creates the table if it is absent and adds a column when th
 struct gains a field.
 
 All three take `CreateIfMissing`. Where it is off and the table does not exist,
-`Migrate` returns an error wrapping `ErrTableMissing` rather than creating it.
+`Sink` returns an error wrapping `ErrTableMissing` rather than creating it.
 
 ```go
 bqsink.WithMigrationStrategy(bqsink.MigrationNone{})  // write to a table something else owns
@@ -379,26 +420,42 @@ A difference BigQuery cannot reconcile — a changed type, NULLABLE turning
 REQUIRED, or a change inside a RECORD — is reported as an error wrapping
 `ErrSchemaConflict` rather than migrated.
 
-`Migrate` runs once per `Sinker` and caches its outcome, success or failure alike.
+The migration runs once per `Sinker` and caches its outcome, success or failure alike.
 Recovering from a failure means building a new `Sinker`.
 
 ## Transports
 
+A writer is built directly from the transport's own settings, before there is a
+`Sinker` to hand it to. **There is no default transport any more** — an unset
+Option used to mean `&StorageWrite{}`; now the choice is which constructor you
+call:
+
 ```go
-bqsink.WithWriteStrategy(&bqsink.StorageWrite{})  // the default
-bqsink.WithWriteStrategy(&bqsink.LoadJobs{})
+w, err := (&bqsink.StorageWrite{}).NewWriter(client, relation)
+w, err := (&bqsink.LoadJobs{}).NewWriter(client, relation)
 ```
 
-**`StorageWrite`** uses the BigQuery Storage Write API. Each `Sink` sends its rows
-as one append and waits for BigQuery to accept them. An append is all or nothing:
-none of the rows in a rejected request land. Only the default and committed stream
-types are supported.
+Neither talks to BigQuery yet: `NewWriter` only builds the writer, and what
+happens over the network happens on the first `Sink`, through the writer
+`NewSinker` was given.
 
-**`LoadJobs`** renders the rows as newline delimited JSON and submits one load job
-per `Sink`, blocking until BigQuery finishes it, which takes seconds to minutes.
-A load job is all or nothing too. Nothing is serialised on a lock, so concurrent
-calls submit concurrent jobs — and a table's daily job quota is why rows belong in
-batches rather than one call each.
+Every `WriteRows` returns a `WriteResult`, whose `Wait` reports how many of that
+call's rows landed. Using `Sink` hides this entirely: it calls `WriteRows` and
+blocks on `Wait` before returning, so "how many rows landed" is already the plain
+`(n, err)` `Sink` gives back, and there is nothing further to wait on. A
+`WriteResult` matters on its own only where something drives the writer directly —
+see [Flushing rows](#flushing-rows) below.
+
+**`StorageWrite`** uses the BigQuery Storage Write API. Each append is all or
+nothing: none of the rows in a rejected request land. Only the default and
+committed stream types are supported.
+
+**`LoadJobs`** renders the rows as newline delimited JSON and submits a load job,
+blocking until BigQuery finishes it, which takes seconds to minutes. A load job is
+all or nothing too. Nothing is serialised on a lock, so concurrent calls submit
+concurrent jobs — and a table's daily job quota is why rows belong in batches
+rather than one call each; `FlushRows` gathers several calls into fewer jobs (see
+[Flushing rows](#flushing-rows)).
 
 Large batches can be staged in Cloud Storage instead of being uploaded with the
 job:
@@ -406,13 +463,69 @@ job:
 ```go
 import "github.com/mashiike/bqsink/bqgcs"
 
-bqsink.WithWriteStrategy(&bqsink.LoadJobs{
+w, err := (&bqsink.LoadJobs{
 	Staging: &bqgcs.Staging{Client: gcsClient, Bucket: "staging-bucket", Prefix: "bqsink"},
-})
+}).NewWriter(client, relation)
 ```
 
 `bqgcs` is a separate package so that using bqsink does not pull in
 `cloud.google.com/go/storage`.
+
+## Flushing rows
+
+`LoadJobs.FlushRows` gathers rows across `WriteRows` calls and submits them as one
+load job once that many are held, instead of a job per call:
+
+```go
+w, err := (&bqsink.LoadJobs{FlushRows: 10_000}).NewWriter(client, relation)
+```
+
+Waiting on a `WriteResult` is what submits the batch its rows are in, which is why
+`FlushRows` helps some callers and not others. Several goroutines calling `Sink` on
+the same writer at once share a job: the rows of every call that joins the open
+batch before one of them waits travel together, and each still gets back its own
+count when it waits. One goroutine calling `Sink` on its own, one batch after
+another, still gets a job per call, because `Sink` always waits before it returns
+and there is no one else's rows to gather in behind it — batching a caller like
+that is done the ordinary way, by giving `Sink` more rows per call, not by raising
+`FlushRows`.
+
+`FlushRows` earns its keep where rows are given to the writer directly through
+`WriteRows` — a lower-level entry point than `Sink`, taking already-marshalled
+`[]bqsink.Row`, and usable once some `Sinker` built on this writer has made its
+first `Sink` call to bind the schema — gathering them without waiting on each
+result right away:
+
+```go
+r1, err := w.WriteRows(ctx, rows1) // joins the open batch, no job yet
+if err != nil {
+	return err
+}
+r2, err := w.WriteRows(ctx, rows2) // joins the same batch
+if err != nil {
+	return err
+}
+
+// later, e.g. from a ticker, or once enough calls have gone by:
+if err := w.Flush(ctx); err != nil {
+	return err
+}
+if _, err := r1.Wait(ctx); err != nil { // already settled by Flush
+	return err
+}
+if _, err := r2.Wait(ctx); err != nil {
+	return err
+}
+```
+
+`Close` submits whatever `FlushRows` is still holding back, so rows gathered but
+never flushed are not lost to a shutdown; it is also where a load job that failed
+with nobody ever waiting on it gets reported, since that would otherwise be rows
+lost with no one told.
+
+**Buffering rows for longer does not by itself mean fewer jobs.** It only helps
+where several calls' rows actually share one open batch before being waited for,
+which is either concurrent `Sink` callers or a caller driving `WriteRows` itself.
 
 ## Retries
 
@@ -426,12 +539,12 @@ write behind the writer's back.
 bqsink.WithMigrationStrategy(bqsink.SyncAllColumns{}, bqsink.DefaultRetryPolicy)
 
 // LoadJobs retries a load job itself.
-bqsink.WithWriteStrategy(&bqsink.LoadJobs{RetryPolicy: myPolicy})
+(&bqsink.LoadJobs{RetryPolicy: myPolicy}).NewWriter(client, relation)
 ```
 
 `DefaultRetryPolicy` is four retries with jittered backoff between 200ms and 5s,
 covering a concurrent change to the table, a rate limit, or a server side failure,
-over either HTTP or gRPC. It is what `New` uses for migration when
+over either HTTP or gRPC. It is what `NewSinker` uses for migration when
 `WithMigrationStrategy` is not given: two replicas deploying at once add the same
 column at once, and BigQuery reports that as a failed precondition that only a retry
 gets past.
@@ -456,7 +569,7 @@ relation.
 
 | Level | What it reports |
 |---|---|
-| `Debug` | the difference `Migrate` found, the stream that was opened, the rows a flush carried |
+| `Debug` | the difference the migration found, the stream that was opened, the rows a flush carried |
 | `Info` | a change made to the table, and a load job submitted and finished |
 | `Warn` | something bqsink let pass |
 

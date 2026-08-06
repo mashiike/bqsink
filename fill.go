@@ -47,13 +47,13 @@ type AppendInfo struct {
 //
 // FillRow is called once per row, on a copy, before the conversion and before any
 // retry. Two things follow from that. The value the caller passed to Sink is left
-// untouched, unless T is itself a pointer type, in which case filling reaches the
-// caller's own value. And a retried row carries the values it was first given, so
-// RowID can be used to deduplicate.
+// untouched, unless the row was handed over as a pointer, in which case filling
+// reaches the caller's own value. And a retried row carries the values it was first
+// given, so RowID can be used to deduplicate.
 //
 // It needs a pointer receiver: with a value receiver it would write into a copy
-// that is then discarded, and New rejects that rather than letting the columns stay
-// empty.
+// that is then discarded, and the first Sink rejects that rather than letting the
+// columns stay empty.
 //
 // Embedding is the point, since a promoted method makes the outer row satisfy the
 // interface. IngestionMetadata is a ready-made set of columns; a type of your own works
@@ -118,43 +118,62 @@ func newID() (string, error) {
 	return id.String(), nil
 }
 
-// fillerFunc reaches the RowFiller of a value of type T.
-type fillerFunc[T any] func(*T) RowFiller
-
-// rowFillerOf works out how a value of T reaches its RowFiller, returning nil when
-// T does not implement it.
+// checkRowFiller fails when rt implements RowFiller with a value receiver, since
+// filling a copy that is then discarded leaves the columns empty with nothing to
+// show why.
 //
-// It fails when T implements the interface with a value receiver, since filling a
-// copy that is then discarded leaves the columns empty with nothing to show why.
-func rowFillerOf[T any]() (fillerFunc[T], error) {
-	t := reflect.TypeFor[T]()
-	if t.Kind() == reflect.Pointer {
-		if _, ok := reflect.New(t.Elem()).Interface().(RowFiller); !ok {
-			return nil, nil
-		}
-		// T is already a pointer, so the value the caller passed is the filler.
-		return func(v *T) RowFiller {
-			filler, ok := any(*v).(RowFiller)
-			if !ok {
-				return nil
-			}
-			return filler
-		}, nil
-	}
-	if _, ok := reflect.New(t).Interface().(RowFiller); !ok {
-		return nil, nil
-	}
-	var zero T
-	if _, ok := any(zero).(RowFiller); ok {
-		return nil, fmt.Errorf(
-			"bqsink: %s implements RowFiller with a value receiver, which would fill a copy that is then discarded; give FillRow a pointer receiver",
-			t)
-	}
-	return func(v *T) RowFiller {
-		filler, ok := any(v).(RowFiller)
-		if !ok {
+// Nothing is returned for a type that does fill its own rows: prepare reaches the
+// interface off the pointer it already holds, so no accessor has to be built here.
+// A row passed as a pointer is left alone, since the caller's own value is what
+// gets filled either way.
+func checkRowFiller(rt reflect.Type) error {
+	if rt.Kind() == reflect.Pointer {
+		if _, ok := reflect.New(rt.Elem()).Interface().(RowFiller); ok {
 			return nil
 		}
-		return filler
-	}, nil
+		// A row handed over as a pointer is filled through that pointer, so what
+		// matters is whether the pointer fills rows. It not doing so while what it
+		// points at embeds something that does is the same silent miss as below.
+		return checkUnpromotedFiller(rt.Elem())
+	}
+	if _, ok := reflect.New(rt).Interface().(RowFiller); !ok {
+		return checkUnpromotedFiller(rt)
+	}
+	if _, ok := reflect.New(rt).Elem().Interface().(RowFiller); ok {
+		return fmt.Errorf(
+			"bqsink: %s implements RowFiller with a value receiver, which would fill a copy that is then discarded; give FillRow a pointer receiver",
+			rt)
+	}
+	return nil
+}
+
+// checkUnpromotedFiller fails when rt embeds something that fills rows without
+// promoting its FillRow, which is what a type built by reflect.StructOf does: Go
+// promotes the methods an embedded type declares on a value receiver to such a
+// type, but not those on a pointer receiver. Embedding IngestionMetadata in one
+// would therefore leave its columns empty with nothing to show why.
+//
+// Only what rt embeds directly is looked at, since that is where a declaration
+// puts it.
+func checkUnpromotedFiller(rt reflect.Type) error {
+	if rt.Kind() != reflect.Struct {
+		return nil
+	}
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		if !f.Anonymous {
+			continue
+		}
+		embedded := f.Type
+		if embedded.Kind() == reflect.Pointer {
+			embedded = embedded.Elem()
+		}
+		if _, ok := reflect.New(embedded).Interface().(RowFiller); !ok {
+			continue
+		}
+		return fmt.Errorf(
+			"bqsink: %s embeds %s, which fills rows, but does not promote its FillRow, so the columns it declares would stay empty; a type built at run time promotes a value receiver's methods alone, so declare those columns as fields of your own and fill them in before Sink",
+			rt, f.Type)
+	}
+	return nil
 }

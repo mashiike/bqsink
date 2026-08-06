@@ -107,20 +107,20 @@ func TestAnExternalTypeIsJSONEitherWay(t *testing.T) {
 func TestRegisteredMarshalerChangesHowAStructIsEncoded(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[marshalerRow](testClient(t), testRelation(), WithMarshalers(
+	s, err := testSinker[marshalerRow](t, WithMarshalers(
 		MarshalFunc(bigquery.StringFieldType, func(e external) (bigquery.Value, error) {
 			return "amount=" + e.Amount, nil
 		}),
 	))
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
-	if got := s.Schema()[3].Type; got != bigquery.StringFieldType {
+	if got := s.schema[3].Type; got != bigquery.StringFieldType {
 		t.Errorf("External type = %s, want STRING from the registered marshaler", got)
 	}
-	row, err := s.toRow(marshalerRow{External: external{Amount: "9"}})
+	row, err := s.plan.marshalRow(reflect.ValueOf(marshalerRow{External: external{Amount: "9"}}))
 	if err != nil {
-		t.Fatalf("toRow() error = %v", err)
+		t.Fatalf("marshalRow() error = %v", err)
 	}
 	if got := row["External"]; got != "amount=9" {
 		t.Errorf("row[External] = %#v, want the registered conversion's output", got)
@@ -244,8 +244,8 @@ func TestWithMarshalersRejectsAnEmptyList(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if _, err := New[simpleRow](testClient(t), testRelation(), tt.opt); err == nil {
-				t.Fatal("New() should reject the option")
+			if _, err := testSinker[simpleRow](t, tt.opt); err == nil {
+				t.Fatal("testSinker() should reject the option")
 			}
 		})
 	}
@@ -254,13 +254,13 @@ func TestWithMarshalersRejectsAnEmptyList(t *testing.T) {
 func TestNewAppliesMarshalersToTheSchema(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[marshalerRow](testClient(t), testRelation(), WithMarshalers(jsonMarshalers()))
+	s, err := testSinker[marshalerRow](t, WithMarshalers(jsonMarshalers()))
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
-	schema := s.Schema()
+	schema := s.schema
 	if len(schema) != 4 {
-		t.Fatalf("Schema() returned %d columns, want 4", len(schema))
+		t.Fatalf("schema has %d columns, want 4", len(schema))
 	}
 	if schema[3].Type != bigquery.JSONFieldType {
 		t.Errorf("External type = %s, want JSON from the registered marshaler", schema[3].Type)
@@ -290,12 +290,12 @@ func (spelledOutRow) BigQueryTableMetadata() *bigquery.TableMetadata {
 func TestASpelledOutSchemaOverridesTheDerivedTypes(t *testing.T) {
 	t.Parallel()
 
-	s, err := New[spelledOutRow](testClient(t), testRelation(), WithMarshalers(jsonMarshalers()))
+	s, err := testSinker[spelledOutRow](t, WithMarshalers(jsonMarshalers()))
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("testSinker() error = %v", err)
 	}
-	if want := spelledOutSchema(); !reflect.DeepEqual(s.Schema(), want) {
-		t.Errorf("Schema() = %s, want the spelled out %s", formatSchema(s.Schema()), formatSchema(want))
+	if want := spelledOutSchema(); !reflect.DeepEqual(s.schema, want) {
+		t.Errorf("schema = %s, want the spelled out %s", formatSchema(s.schema), formatSchema(want))
 	}
 }
 
@@ -312,9 +312,9 @@ func (tooNarrowRow) BigQueryTableMetadata() *bigquery.TableMetadata {
 func TestASpelledOutSchemaMustCoverEveryWrittenColumn(t *testing.T) {
 	t.Parallel()
 
-	_, err := New[tooNarrowRow](testClient(t), testRelation(), WithMarshalers(jsonMarshalers()))
+	_, err := testSinker[tooNarrowRow](t, WithMarshalers(jsonMarshalers()))
 	if err == nil {
-		t.Fatal("New() error = nil, want a rejection of the schema missing columns the struct writes")
+		t.Fatal("testSinker() error = nil, want a rejection of the schema missing columns the struct writes")
 	}
 }
 

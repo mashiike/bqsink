@@ -9,9 +9,38 @@
 // meaning, and two places to say what a table is means two answers to keep
 // agreeing.
 //
-// The Options settle how bqsink behaves around that declaration: what to do about a
-// difference between it and the real table, how rows travel, what gets logged, and
-// how a transient failure is retried.
+// # Writing rows
+//
+// Writing takes two things. A RowsWriter holds what writing depends on — the table,
+// the connection, the transport, how a transient failure is retried — and a Sinker
+// holds what none of that changes: the declaration, bringing the real table in line
+// with it, and turning a row into columns.
+//
+//	w, err := (&bqsink.LoadJobs{}).NewWriter(client, relation)
+//	if err != nil {
+//		return err
+//	}
+//	defer w.Close(ctx)
+//
+//	s, err := bqsink.NewSinker(w, bqsink.DeclarationOf[AccessLog]())
+//	if err != nil {
+//		return err
+//	}
+//	n, err := s.Sink(ctx, logs)
+//
+// The declaration reaches NewSinker rather than being picked up from the first
+// batch, so a mistake in it is reported before anything is written. Nothing contacts
+// BigQuery until the first Sink, which is what reconciles the real table with the
+// declaration and hands the writer the settled schema.
+//
+// Sink returns how many rows landed, and an error whenever that is fewer than it was
+// given, so that rows[n:] are exactly the ones that did not. Nothing is buffered
+// between calls: the rows handed to one Sink are the batch. Closing belongs to the
+// writer, since that is what holds a connection, and a Sinker has nothing waiting.
+//
+// The Options settle how bqsink behaves around the declaration: what to do about a
+// difference between it and the real table, and what gets logged. How rows travel and
+// how a failed write is retried are settled on the writer instead.
 //
 // # Declaring the columns
 //
