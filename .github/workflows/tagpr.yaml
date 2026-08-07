@@ -15,4 +15,4 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: Songmu/tagpr@f117de74a37974968f7812009ed68910b0ec1872 # v1
+      - uses: Songmu/tagpr@d1b8138b7a31075141b6cd64103de9485ced7ac9 # v1
