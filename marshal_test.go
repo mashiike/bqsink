@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"cloud.google.com/go/bigquery"
@@ -107,13 +108,13 @@ func TestAnExternalTypeIsJSONEitherWay(t *testing.T) {
 func TestRegisteredMarshalerChangesHowAStructIsEncoded(t *testing.T) {
 	t.Parallel()
 
-	s, err := testSinker[marshalerRow](t, WithMarshalers(
+	s, err := NewSinker(newFakeWriter(t), DeclarationOf[marshalerRow](
 		MarshalFunc(bigquery.StringFieldType, func(e external) (bigquery.Value, error) {
 			return "amount=" + e.Amount, nil
 		}),
 	))
 	if err != nil {
-		t.Fatalf("testSinker() error = %v", err)
+		t.Fatalf("NewSinker() error = %v", err)
 	}
 	if got := s.schema[3].Type; got != bigquery.StringFieldType {
 		t.Errorf("External type = %s, want STRING from the registered marshaler", got)
@@ -230,33 +231,12 @@ func TestNilMarshalersIsEmpty(t *testing.T) {
 	}
 }
 
-func TestWithMarshalersRejectsAnEmptyList(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		opt  Option
-	}{
-		{name: "no argument", opt: WithMarshalers()},
-		{name: "only nils", opt: WithMarshalers(nil, nil)},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if _, err := testSinker[simpleRow](t, tt.opt); err == nil {
-				t.Fatal("testSinker() should reject the option")
-			}
-		})
-	}
-}
-
 func TestNewAppliesMarshalersToTheSchema(t *testing.T) {
 	t.Parallel()
 
-	s, err := testSinker[marshalerRow](t, WithMarshalers(jsonMarshalers()))
+	s, err := NewSinker(newFakeWriter(t), DeclarationOf[marshalerRow](jsonMarshalers()))
 	if err != nil {
-		t.Fatalf("testSinker() error = %v", err)
+		t.Fatalf("NewSinker() error = %v", err)
 	}
 	schema := s.schema
 	if len(schema) != 4 {
@@ -290,9 +270,9 @@ func (spelledOutRow) BigQueryTableMetadata() *bigquery.TableMetadata {
 func TestASpelledOutSchemaOverridesTheDerivedTypes(t *testing.T) {
 	t.Parallel()
 
-	s, err := testSinker[spelledOutRow](t, WithMarshalers(jsonMarshalers()))
+	s, err := NewSinker(newFakeWriter(t), DeclarationOf[spelledOutRow](jsonMarshalers()))
 	if err != nil {
-		t.Fatalf("testSinker() error = %v", err)
+		t.Fatalf("NewSinker() error = %v", err)
 	}
 	if want := spelledOutSchema(); !reflect.DeepEqual(s.schema, want) {
 		t.Errorf("schema = %s, want the spelled out %s", formatSchema(s.schema), formatSchema(want))
@@ -312,9 +292,9 @@ func (tooNarrowRow) BigQueryTableMetadata() *bigquery.TableMetadata {
 func TestASpelledOutSchemaMustCoverEveryWrittenColumn(t *testing.T) {
 	t.Parallel()
 
-	_, err := testSinker[tooNarrowRow](t, WithMarshalers(jsonMarshalers()))
+	_, err := NewSinker(newFakeWriter(t), DeclarationOf[tooNarrowRow](jsonMarshalers()))
 	if err == nil {
-		t.Fatal("testSinker() error = nil, want a rejection of the schema missing columns the struct writes")
+		t.Fatal("NewSinker() error = nil, want a rejection of the schema missing columns the struct writes")
 	}
 }
 
@@ -331,5 +311,23 @@ func TestMarshalFuncPropagatesTheConversionError(t *testing.T) {
 	}
 	if _, err := one.marshal(external{}); !errors.Is(err, sentinel) {
 		t.Errorf("marshal() error = %v, want the sentinel", err)
+	}
+}
+
+// TestABadMarshalerSurfacesFromNewSinker checks that a Marshalers built from
+// a rejected call, such as MarshalFunc given a nil function, is reported as
+// the Declaration's own error and, from there, as NewSinker's — the route
+// WithMarshalers used before it was removed in favour of passing marshalers
+// straight to DeclarationOf.
+func TestABadMarshalerSurfacesFromNewSinker(t *testing.T) {
+	t.Parallel()
+
+	m := MarshalFunc(bigquery.StringFieldType, (func(external) (bigquery.Value, error))(nil))
+	decl := DeclarationOf[marshalerRow](m)
+	if decl.err == nil || !strings.Contains(decl.err.Error(), "nil function") {
+		t.Fatalf("DeclarationOf() decl.err = %v, want it to mention a nil function", decl.err)
+	}
+	if _, err := NewSinker(newFakeWriter(t), decl); err == nil || !strings.Contains(err.Error(), "nil function") {
+		t.Errorf("NewSinker() error = %v, want it to surface DeclarationOf's error", err)
 	}
 }

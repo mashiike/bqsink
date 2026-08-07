@@ -66,10 +66,12 @@ func rowDescriptor(schema bigquery.Schema) (protoreflect.MessageDescriptor, erro
 // StorageWrite writes rows through the BigQuery Storage Write API. It is the
 // settings a StorageWriter is made from.
 //
-// WriteRows sends the rows as one append and hands back a WriteResult without
-// waiting for BigQuery to accept them; that wait happens in the WriteResult's
-// Wait. An append is all or nothing: BigQuery appends none of the rows in a
-// request it rejects.
+// What a WriteResult reports is particular to the writer that returned it.
+// StorageWrite's WriteRows sends the rows as one append and returns before
+// BigQuery has acknowledged them, so the WriteResult it hands back is
+// genuinely pending: there is no earlier point, such as the rows merely being
+// accepted, for its Wait to report instead. An append is all or nothing:
+// BigQuery appends none of the rows in a request it rejects.
 //
 // BigQuery caps how large an append request may be, and StorageWrite does not split
 // one, so a batch past that cap is rejected rather than divided. Where batches are
@@ -235,6 +237,9 @@ func (w *StorageWriter) BindSchema(ctx context.Context, schema bigquery.Schema) 
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed {
+		return fmt.Errorf("bqsink: StorageWriter: %w", ErrWriterClosed)
+	}
 	if w.stream != nil {
 		return errors.New("bqsink: StorageWriter: a schema is already bound")
 	}
@@ -297,11 +302,12 @@ func (w *StorageWriter) writerOptions(descriptor *descriptorpb.DescriptorProto) 
 }
 
 // WriteRows implements RowsWriter. It marshals the rows and sends them as one
-// append, returning a WriteResult that reports whether BigQuery accepted them
-// once Wait is called.
+// append, returning a WriteResult whose Wait reports BigQuery's real ack of
+// the append: the rows' one and only delivery result, since StorageWrite has
+// no earlier point to call them accepted.
 //
-// An append is all or nothing, so the WriteResult's Wait reports len(rows) or
-// 0: BigQuery appends none of the rows in a request it rejects.
+// An append is all or nothing, so Wait reports len(rows) or 0: BigQuery
+// appends none of the rows in a request it rejects.
 func (w *StorageWriter) WriteRows(ctx context.Context, rows []Row) (WriteResult, error) {
 	if len(rows) == 0 {
 		return ResolvedResult(0, nil), nil
@@ -314,7 +320,7 @@ func (w *StorageWriter) WriteRows(ctx context.Context, rows []Row) (WriteResult,
 	descriptor := w.descriptor
 	w.mu.Unlock()
 	if closed {
-		return nil, errors.New("bqsink: StorageWriter: the writer is closed")
+		return nil, fmt.Errorf("bqsink: StorageWriter: %w", ErrWriterClosed)
 	}
 	if stream == nil {
 		return nil, errors.New("bqsink: StorageWriter: no schema is bound yet")

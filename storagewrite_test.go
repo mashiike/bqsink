@@ -337,3 +337,29 @@ func TestStorageWriteNewWriterRejectsAMalformedStreamName(t *testing.T) {
 		})
 	}
 }
+
+// TestStorageWriteBindSchemaAfterCloseFails checks that BindSchema checks
+// closed the way WriteRows does. Without that check, calling BindSchema after
+// Close opens a fresh client and stream that Close already ran and so nothing
+// will ever close again: a leak reachable just by calling Close and then Sink,
+// no concurrency required.
+func TestStorageWriteBindSchemaAfterCloseFails(t *testing.T) {
+	t.Parallel()
+
+	writer, err := (&StorageWrite{}).NewWriter(testClient(t), testRelation())
+	if err != nil {
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	if err := writer.Close(t.Context()); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if err := writer.BindSchema(t.Context(), storageWriteSchema()); err == nil {
+		t.Fatal("BindSchema() error = nil, want a rejection of binding after Close")
+	} else if !strings.Contains(err.Error(), "closed") {
+		t.Errorf("BindSchema() error = %v, want it to say the writer is closed", err)
+	}
+	if writer.mwClient != nil || writer.stream != nil {
+		t.Error("BindSchema() opened a client or a stream after Close; neither will ever be closed")
+	}
+}

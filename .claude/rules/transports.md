@@ -33,8 +33,8 @@ WriteResult.Wait(ctx) (n int, err error)    // n < len(rows) なら必ず non-ni
 
 **バッファは 2026-08-05 に `LoadJobsWriter` へ戻したが、成分の両方が構造的に消えている。**
 
-- **結果はバッファの状態ではなく「バッチ」に紐づく。** `loadResult` は自分の行が入った `*loadBatch` を握っていて、`Wait` はそのバッチの結末を読む。「もう一度呼んだらバッファが空だった」という経路が存在しない
-- **1つのバッチは1回だけ投入される**（`claimed atomic.Bool` の CAS）。勝者が投入し、他の待ち手は `done` チャネルで同じ結末を受け取る
+- **結果はバッファの状態ではなく「取り出した瞬間のバッチ」に紐づく。** 閾値到達でも `FlushRows` でも、投入するのは `batch := w.buf; w.buf = nil` で `w.buf` から切り離した後の値で、投入した行が再び `w.buf` を経由することはない。「もう一度呼んだらバッファが空だった」という経路が存在しない
+- **1つの投入は1回しか起こらない。** 切り出しと `wg.Add` が同じロック区間の中にあるので、閾値到達を跨いで積まれた行を2つの呼び出しが同時に取り出すことはない。投入の失敗は呼び出し元には返らず `pending` に積まれ、次の `FlushRows` / `Close` が一度だけ報告する
 - **`Sinker` は今も `WriteRows` / `Wait` をリトライで包まない**（下記「リトライは行を持っている層が持つ」）
 
 **`WriteRows` に状態を足すときは、その状態ではなく結果の紐づけ先を確認すること。** バッチに紐づいている限り安全で、バッファの有無を見て分岐し始めたら危険。
@@ -56,12 +56,12 @@ WriteResult.Wait(ctx) (n int, err error)    // n < len(rows) なら必ず non-ni
 | 層 | リトライ |
 |---|---|
 | `Sinker.start`（マイグレーション） | `WithMigrationStrategy` の第2引数（nil なら1回だけ） |
-| `LoadJobsWriter.submit`（ジョブ投入） | `LoadJobs.RetryPolicy`（nil なら `DefaultRetryPolicy`） |
+| `LoadJobsWriter.load`（ジョブ投入） | `LoadJobs.RetryPolicy`（nil なら `DefaultRetryPolicy`） |
 | `StorageWriter.WriteRows` | managedwriter の `EnableWriteRetries(true)` |
 
 **`Sinker` が `WriteRows` / `WriteResult.Wait` を `retrying` で包んではいけない。** 包むと「writer が諦めた後にもう一度呼ぶ」ことになり、上記のバグが再発する。
 
-リトライは `submit` の中（`w.load` を包む形）にある。**バッチ単位でリトライされ、成功しても失敗してもその結末が `done` の閉鎖で全待ち手に伝わる**ので、リトライ中に別の goroutine が同じバッチを二重投入することはない。
+リトライは `load` の中（`w.loader.load` を包む形）にある。**バッチは投入前に `w.buf` から切り離されるので、リトライ中に別の goroutine が同じ行を二重に取り出すことはない。**
 
 `retrying` はパッケージレベル関数で、`newRetryer == nil` なら op を1回呼ぶ。gax は回数制限を提供しないので `attemptLimiter` で足している。
 
@@ -95,13 +95,15 @@ bqsink は at-least-once で exactly-once 未対応なので条件に合致す�
 |---|---|
 | `logger` | `BindLogger`（`NewSinker` から1回） |
 | `schema` / `descriptor` / `stream` | `BindSchema`（初回 `Sink` から1回） |
-| `open` / `failed` / `closed`（LoadJobs） | `WriteRows` / `Flush` / `Close` |
+| `buf` / `pending` / `closed`（LoadJobs） | `WriteRows` / `FlushRows` / `Close` |
 
 **ロック下で読んだ値をローカル変数に取り出してから I/O する。** `StorageWriter.WriteRows` が `stream` / `schema` / `descriptor` をまとめて取り出しているのはこのため（`marshalStorageWriteRow` が自由関数で、writer を参照しないのも同じ理由）。ロック外で `w.schema` を読むと `BindSchema` と競合する。
 
 **例外: `StorageWriter.BindSchema` は関数全体でロックを保持する**（ネットワーク呼び出し中も）。「bind 済みか」を確認してから解放し、開いてから再ロックする形にすると、**並行する2つの `BindSchema` が両方ともクライアントとストリームを開いてリークする**。1回しか呼ばれない契約なので保持コストは問題にならない。
 
-以前は「writer は状態を持たないのでロックが無い」と書いてあり、**閾値到達時にジョブ完了までロックを握って並行 `Sink` を全部待たせる**という過去の問題もここに記録されていた。今のバッファはその問題を避けている（前節の3つの安全装置を参照）。
+**`Close` 後に呼ばれても同じようにリークするバグが既存にあった**（`closed` を確認していなかった）。修正済みで、今は関数の先頭でロックを取った直後に `closed` を確認し、閉じていれば何も開かずに返る。
+
+以前は「writer は状態を持たないのでロックが無い」と書いてあり、**閾値到達時にジョブ完了までロックを握って並行 `Sink` を全部待たせる**という過去の問題もここに記録されていた。今のバッファはその問題を避けている（後述の「バッファがある writer の安全装置」を参照）。
 
 **フィールドを足すときは「呼び出しをまたいで変化するか」と「I/O 中に保持するか」を確認する。**
 
@@ -124,7 +126,9 @@ bqsink は at-least-once で exactly-once 未対応なので条件に合致す�
 
 **writer を直接構造体リテラルで作るテストは `logger` を埋めること。** `NewWriter` が `slog.DiscardHandler` で初期化し `BindLogger` が差し替える契約なので、**内部では nil チェックしていない**（`loadjobs_test.go` の直接構築で一度 panic させた）。
 
-**`Wait` を通らない転送層のテストは書けない。** `WriteRows` は `WriteResult` を返すだけなので、`Wait` を呼ばないテストはジョブの投入自体を検証していない（`LoadJobsWriter` は `flushRows == 0` でも投入は `WriteRows` の中だが、結果の検査は `Wait` 経由）。
+**`Wait` を通らない転送層のテストはジョブの投入まで検証していない。** `flushRows == 0` の `LoadJobsWriter.WriteRows` と `StorageWriter.WriteRows` はそこが変わらない: 投入は `WriteRows` の中だが、結果の検査は返した `WriteResult` の `Wait` 経由。
+
+**`flushRows` を設定した `LoadJobsWriter.WriteRows` はここが逆転する。** 返す `WriteResult` は受理を約束するだけなので、`Wait` は常に `(len(rows), nil)` を返し、ジョブの成否を一切運ばない。そのジョブを検証するテストは `Wait` ではなく `FlushRows` か `Close` の戻り値を見る必要がある。
 
 ## Storage Write API の proto 型は素直ではない
 
@@ -192,39 +196,45 @@ silently lossy なオプションを残すより拒否する方を選んだ。
 
 ## バッファは `LoadJobsWriter` にあり、`Sinker` には無い
 
-**2026-08-05 に方針が変わった。** 以前は「バッファリングは呼び出し側の仕事」で `FlushRows` は削除されていたが、E案で `LoadJobs.FlushRows` として転送層に戻した。**根拠は「ジョブ数 quota とジョブ単位のオーバーヘッドは LoadJobs 固有の経済性であって、転送に依らない性能アドオンではない」。** だから `StorageWrite` 側にバッファは無く、`Flush` も `LoadJobsWriter` にしか生えていない。この非対称は意図的。
+**2026-08-05 に方針が変わった。** 以前は「バッファリングは呼び出し側の仕事」で `FlushRows` は削除されていたが、E案で `LoadJobs.FlushRows` として転送層に戻した。**根拠は「ジョブ数 quota とジョブ単位のオーバーヘッドは LoadJobs 固有の経済性であって、転送に依らない性能アドオンではない」。** だから `StorageWrite` 側にバッファは無く、`FlushRows` も `LoadJobsWriter` にしか生えていない。この非対称は意図的。
 
-**却下した形**: `Sinker` の外に汎用の `BufferedWriter` デコレータを置く案（`bufio` と同型）。StorageWrite にも巻けてしまい、ドメインと乖離する。`Sinker` に `Flush` を生やす案も却下 — writer を作るのは呼び出し側なので、手元の writer に直接 `Flush` を呼べる。
+**却下した形**: `Sinker` の外に汎用の `BufferedWriter` デコレータを置く案（`bufio` と同型）。StorageWrite にも巻けてしまい、ドメインと乖離する。`Sinker` に `Flush` を生やす案も却下 — writer を作るのは呼び出し側なので、手元の writer に直接 `FlushRows` を呼べる。
+
+### なぜ per-call 配送をやめたか
+
+E案（2026-08-05）は「バッファ×呼び出しごとの配送約束」を両立させようとしていた。`WriteRows` はバッファに乗せるだけで返るのに、返す `WriteResult` は依然として**配送**（ジョブが実際に終わった結果）を約束していて、その約束を果たすのは `Wait` の役目だった。**`Wait` は「結果を知る」ことと「投入を強制する」ことを兼ねていた。**
+
+半端に埋まったバッファの前ではこの二重役割は両立しない。閾値に達していなくても `Wait` が呼ばれたら、配送を約束した以上そこで投入するしかない。`Sinker.Sink` は `WriteRows` の直後に `Wait` を呼ぶので、**呼ぶたびに閾値未達のバッファを強制的に吐き出す**ことになり、バッファがあってもジョブは呼び出しごとに1本のままだった。
+
+今の設計は約束の対象を層で分けてこれを解いた（`WriteResult` の GoDoc 参照）。`FlushRows` を設定した `LoadJobsWriter.WriteRows` は**受理**だけを約束し、その `WriteResult.Wait` は常に即座に解決済みの `(len(rows), nil)` を返す——投入を強制しない。**配送**の約束は `FlushRows` や `Close` が返す別の `WriteResult` に移した。「結果を知る」と「投入を強制する」を同じ `Wait` に持たせない、という一点が矛盾を解いている。
 
 ### `FlushRows` の効きどころ（GoDoc に書いた内容の根拠）
 
-`Sinker.Sink` は同期で、内部で `WriteResult.Wait` を即座に呼ぶ。**`Wait` は自分のバッチを投入するので、1つの goroutine が順番に `Sink` する限りジョブは呼び出しごとに1本のまま**（バッファは効かない）。効くのは:
+**単一 goroutine + 同期 `Sink` でも、今はバッファが効く。** 前節の通り、閾値未達の `WriteRows` は投入せずに受理だけを返すので、`Sinker.Sink` が毎回 `Wait` を呼んでもそれは投入を強制しない。行は `w.buf` に積まれ続け、閾値に達した呼び出しだけがジョブを1本投入する。**単一 goroutine の逐次 `Sink` でジョブが減らなかったのが、この再設計の主目的の1つ。**
 
-- **複数 goroutine が同時に書くとき。** 誰かが `Wait` する前に同じバッチへ入った行が1本のジョブで運ばれる。しかも各呼び出しは自分の結末を失わない（バッチの結果を全員が受け取る）
-- **`Flush` を明示的に呼ぶとき**（ticker など）
+それでも次の場面には別の意味がある:
+
+- **`FlushRows` を明示的に呼ぶとき**（ticker や shutdown 前の drain など）。閾値未達の行を持ち越したくないときに使う
+- **複数 goroutine が同時に書くとき。** 閾値到達を跨いで別の呼び出しの行が同じバッファに積まれるので、各呼び出しは自分の行数分の受理をすぐ返せる一方、ジョブは1本にまとまる
 - **`Wait` を後回しにするとき**（`Sinker` を経由せず writer を直接使う場合）
 
-**「バッファすればジョブが減る」と書いてはいけない。** 単一 goroutine + 同期 `Sink` では減らない。減らしたいなら将来 `SinkAsync` 的な非同期の顔を足す（非破壊で足せる位置に置いてある）。
+**「バッファは受理までしか約束しない」ことを見落としてテストを書かない。** `flushRows` を設定した `WriteRows` が返す `WriteResult` の `Wait` は、前節の通りジョブの成否を一切運ばない。ジョブの結果を検証するテストは `FlushRows` か `Close` の戻り値を見る。
 
 ### バッファがある writer の安全装置
 
-1. **閾値に達したバッチは、それを満たした `WriteRows` が同期的に投入する**（`bufio.Write` がバッファ満杯で flush するのと同じ）。だから保持する行が無限に増えない
-2. **`Close` が3つを報告する**: 保留中の行の投入結果、**誰かが `Wait` していない失敗**、そして**閉じる時点で走っているジョブの結末**
-3. **失敗したバッチの行は捨てる**（retain-until-delivered にしない）。保持し続けると head-of-line blocking と無限成長になる。行を持っているのは呼び出し側なので再送はそちらの判断
+1. **閾値に達したバッファは、それを満たした `WriteRows` がその場で同期的に投入する**（`bufio.Write` がバッファ満杯で flush するのと同じ）。投入前に `batch := w.buf; w.buf = nil` で切り離すので、保持する行が無限に増えない
+2. **`Close` は `wg.Wait()` で「`WriteRows` の閾値投入」と「`FlushRows` 自身の投入」の両方が終わるのを待ってから、初めて `pending` を読む。** この順序が要点: `WriteRows` は投入が失敗したら `pending` に積んでから（`defer` の）`wg.Done()` を呼ぶので、`Close` が待った後に読む `pending` には、待っている間に終わった投入の失敗も必ず反映されている。`Close` が報告するのは、その `pending` と、`Close` 自身がバッファの残りを投入した結果の2つだけ
+3. **`FlushRows` 自身が投入した分の結果は `pending` に一切乗らない。** `FlushRows` は自分の投入だけ `wg.Add` してその場で走らせ、`wg.Wait()` はしない。だから同時に走っている `WriteRows` 発の投入の結末は次の `FlushRows` か `Close` に残るが、**`FlushRows` 自身の投入結果を回収できるのはその呼び出しが返す `WriteResult` を `Wait` することだけで、それをしないと `Close` を含め誰にも届かない**
+4. **失敗したバッチの行は捨てる**（retain-until-delivered にしない）。保持し続けると head-of-line blocking と無限成長になる。行を持っているのは呼び出し側なので再送はそちらの判断
+5. **`wg.Add` は必ず `closed` 検査と同じロック区間の中で呼ぶ**（`WriteRows` の閾値到達時・`FlushRows` 自身の投入時のいずれも）。`Close` は `closed = true` をロック下で立ててから `wg.Wait()` するので、この規律により `Add` は必ず `Wait` より前に起こる（`sync.WaitGroup` が要求する順序）。ロック区間の外に `Add` を出すと `Close` の `Wait` と競合し得る
 
-**`loadBatch.unread` は「バッチ単位のフラグ」ではなく「まだ結末を受け取っていない呼び出しの数」。** ここを1ビットにすると、**3つの `Sink` が同じバッチを共有していて1つだけが `Wait` した場合に、残り2つの失敗が握り潰される**（`Close` が「既読」と見なして落とす）。`WriteRows` が結果を作るたびに `+1`、各 `loadResult.Wait` が初回だけ `-1`。**`Close` は `unread > 0` のバッチだけ報告する。** 2026-08-05 のレビューで、1ビット版のこの欠落を指摘されて直した。
+### 共有バッファの ctx は「投入した呼び出し」のもの（設計上の制約）
 
-**`Close` は `inflight` が 0 になるまで待つ**（`sync.Cond`）。待たないと、別の goroutine が投入したジョブが**まだ走っている間に `Close` が `failed` を覗いて何も見つけず nil を返し**、その後で追記された失敗が誰にも届かない。`Cond` は `settled()` で遅延生成する（テストが構造体リテラルで writer を組むため）。
+`WriteRows` が閾値到達で投入するときも、`FlushRows` がバッファの残りを投入するときも、使うのは**その投入を行った呼び出し自身の ctx**。**その ctx がキャンセルされると、同じバッファに同居している（先に呼ばれて積まれただけで自分では投入しなかった）他の呼び出しの行まで投入失敗の対象になる。** それらの呼び出し自身の `WriteResult` はすでに受理として解決済みなので変わらないが、投入失敗は `pending` に積まれ、次の `FlushRows` か `Close` が報告するまで誰にも見えない。「自分は関与していない ctx のキャンセルで自分の行が失敗の対象になる」という制約自体は、報告の経路が per-call の `Wait` から `pending` 経由に変わっても解消していない。
 
-**`Close` は2回目以降も `failed` を見る。** 早期 `return nil` を置くと上記の穴が復活する。
+- `FlushRows == 0` ならバッファが共有されないので発生しない
+- 解消するには投入を goroutine に切り出して ctx を分離する必要があり、「goroutine を持たない」という現設計の前提を変えることになる。**未対応。** `SinkAsync`（2026-08-06 追加）は `Wait` を呼ぶタイミングを呼び出し側に委ねるだけで、投入自体は依然として `WriteRows` の中で同期的に走るので、この ctx 共有は解消していない
 
-### 共有バッチの ctx は「投入した呼び出し」のもの（設計上の制約）
-
-`submit` は CAS に勝った呼び出しの ctx でジョブを実行する。**その ctx がキャンセルされると、同じバッチに同居している他の呼び出しの行まで失敗として報告される。** `WriteResult.Wait` の GoDoc に明記した。
-
-- `FlushRows == 0` ならバッチは共有されないので発生しない
-- 解消するには投入を goroutine に切り出して ctx を分離する必要があり、「goroutine を持たない」という現設計の前提を変えることになる。**未対応**（`SinkAsync` と一緒に検討する）
-
-**ロックはジョブの実行中に保持しない。** バッチを `w.open` から外してからロックを離し、その後で投入する。以前バッファがあった頃は「閾値到達時にジョブ完了まで（秒〜分）ロックを握って並行する `Sink` を全部待たせる」問題があった。
+**ロックはジョブの実行中に保持しない。** バッチを `w.buf` から切り離してからロックを離し、その後で投入する。以前バッファがあった頃は「閾値到達時にジョブ完了まで（秒〜分）ロックを握って並行する `Sink` を全部待たせる」問題があった。
 
 **`FillRow` は `Sink` の中で呼ばれるので、`_ingestion_at` は投入時刻ではなく `Sink` を呼んだ時刻のまま。** バッファが writer 側（変換済みの `[]Row` を溜める）にあるおかげで、`BufferedSinker` 案にあった罠（flush 時刻になる）を踏んでいない。**バッファを `Sinker` 側に移そうとしたらここが壊れる。**

@@ -42,16 +42,16 @@ return s.dropColumns(ctx, change.DropColumns)
 
 テーブルが存在せず `CreateTable` も要求されないときは `ErrTableMissing` を返す。書き込めないことが確定しているので早期に知らせる。
 
-## 遅延初期化は2段になった（`NewSinker` → `start`）
+## 遅延初期化は2段になった（`declarationOf` → `start`）
 
-**2026-08-05 に3段（`settle` → `reconcile` → `writer`）から変わった。** 宣言が `NewSinker` の引数（`Declaration`）になったので、ローカルな解決は構築時に済む。
+**2026-08-05 に3段（`settle` → `reconcile` → `writer`）から変わり、さらに宣言の評価タイミングが `NewSinker` より前に移った。** 宣言の解決は `DeclarationOf` / `DeclarationFromMetadata` を呼んだ時点で、非公開関数 `declarationOf` が即時に行う。`NewSinker` はできあがった `Declaration` を受け取るだけで、自分では何も解決しない——`decl.err` を転記し、`decl.rowType` が nil でないか（ゼロ値の `Declaration{}` がそのまま渡されていないか）を見るのが仕事のすべて。
 
-| 段 | 何をする | 失敗の性質 |
-|---|---|---|
-| `NewSinker` → `resolveDeclaration` | タグとメソッドから plan / schema / metadata を作る | **ローカル。** ネットワークに出ない。**キャッシュしない** — 構築が失敗するので `Sinker` が存在しない |
-| `start`（`startOnce`） | 実テーブルと和解し（`migrate`）、続けて `writer.BindSchema` を呼ぶ | **ネットワーク。** 412 / 503 はリトライで直る。結果は成否ともキャッシュ |
+| 段 | 何をする | いつ起きる | 失敗の性質 |
+|---|---|---|---|
+| `declarationOf`（`DeclarationOf` / `DeclarationFromMetadata` から呼ばれる） | タグ（または `md.Schema`）とメソッドから plan / schema / metadata を作る | `Declaration` の構築時。**`NewSinker` を呼ぶより前**で、`NewSinker` には持ち越さない | **ローカル。** ネットワークに出ない。**キャッシュしない** — `declarationOf` は値を返して終わるだけなので、`err` を持つ `Declaration` をそのまま `NewSinker` に渡せば同じ失敗が毎回起きる |
+| `start`（`startOnce`） | 実テーブルと和解し（`migrate`）、続けて `writer.BindSchema` を呼ぶ | 初回 `Sink` | **ネットワーク。** 412 / 503 はリトライで直る。結果は成否ともキャッシュ |
 
-**この分け方の根拠は変わっていない**（旧「3段を1つの `Once` に畳んではいけない」と同じ）: **タグの誤字と 503 を同じキャッシュスロットに乗せない。** 前者は何度リトライしても直らず、後者は直りうる。以前は `Once` を2つ持って分けていたが、今は**ローカルな失敗が `Once` に触れない**（コンストラクタが返す）ので、構造的に混ざらない。**`migrate` と `BindSchema` は両方ネットワークなので同じ `Once` でよい。**
+**この分け方の根拠は変わっていない**（旧「3段を1つの `Once` に畳んではいけない」と同じ）: **タグの誤字と 503 を同じキャッシュスロットに乗せない。** 前者は何度リトライしても直らず、後者は直りうる。以前は `Once` を2つ持って分けていたが、今は**ローカルな失敗が `Once` にすら触れない**（`declarationOf` は `sync.Once` の外、`NewSinker` を呼ぶより前に走り、結果を値として持ち歩くだけ）ので、構造的に混ざらない。**`migrate` と `BindSchema` は両方ネットワークなので同じ `Once` でよい。**
 
 **型の一致検査は `Sink` にある。** `rt != s.rowType` ならエラー。宣言は構築時に確定しているので、`Once` の内側と外側を使い分ける必要はなくなった（旧 `settle` の罠が消えた）。
 
@@ -136,7 +136,7 @@ gRPC: Unavailable, DeadlineExceeded, ResourceExhausted, Internal, Aborted
 **2026-08-05 に `NewSinker(w, decl, opts...)` の必須引数として `Declaration` が入ったが、これはこの決定の反転ではない。** 区別すべきは2つ:
 
 - **宣言がどこに住むか** — 変わっていない。`DeclarationOf[T]()` は T のタグと `BigQueryTableMetadata` を読むだけで、宣言の内容を外から書く口はどこにもない
-- **宣言をいつ渡すか** — 変わった。初回 `Sink` の暗黙確定から、構築時の明示引数になった（fail-fast と、実行時型 `DeclarationForType` の正面玄関のため）
+- **宣言をいつ渡すか** — 変わった。初回 `Sink` の暗黙確定から、構築時の明示引数になった（fail-fast と、実行時スキーマの正面玄関のため）。実行時スキーマの経路は当初案の `DeclarationForType(reflect.Type)`（`reflect.StructOf` で型そのものを動的生成する方式）ではなく **`DeclarationFromMetadata(md *bigquery.TableMetadata, marshalers ...*Marshalers)`** になった——行の型は `map[string]any` に固定し、スキーマは `md` というデータから読む。型を作らないので `DeclarationOf[T]()` のジェネリクスに乗らず、素朴に構造体を1つ返す関数になっている
 
 **`WithSchema` 相当（スキーマの内容を Option や引数で渡す）はいま提案されても却下。** `Declaration` が受けるのは*型*で、*宣言の中身*ではない。`Declaration` に `Schema` フィールドを足したくなったら、それは削除した Option の再来。
 
@@ -147,7 +147,7 @@ gRPC: Unavailable, DeadlineExceeded, ResourceExhausted, Internal, Aborted
 
 **理由は「行 struct にはドメイン知識が載っている」こと。** 列の意味を知っているのは行の型を定義した場所なので、そこがテーブルの姿を語る唯一の場所であるべき。他パッケージで定義された行を扱うケースは想定していない（ドメイン知識を反映できないため）。
 
-`WithMarshalers` は例外として残している。こちらは**テーブルの宣言ではなく値の符号化**で、`uuid.UUID` のような他パッケージのフィールド型には `FieldMarshaler` メソッドを足せないため外から登録する口が必要。
+marshalers は例外として残している。こちらは**テーブルの宣言ではなく値の符号化**で、`uuid.UUID` のような他パッケージのフィールド型には `FieldMarshaler` メソッドを足せないため外から登録する口が必要——という原則自体は変わっていない。渡し方は変わった: `WithMarshalers` という Option は削除済みで、いまは `DeclarationOf[T](marshalers ...*Marshalers)` / `DeclarationFromMetadata(md, marshalers ...*Marshalers)` の可変長引数になっている。宣言と同じタイミング（`declarationOf` の呼び出し時）で確定させたいから構築子の引数に寄せてある——`declarationOf` は struct のタグ導出にも書き込み時の値変換にも同じ `*Marshalers` を渡す。
 
 `resolveSchema(metadata, plan)` は「`BigQueryTableMetadata` に `Schema` があればそれ、無ければタグ導出」の2択だけになった。`config` にスキーマもメタデータも持っていない。
 

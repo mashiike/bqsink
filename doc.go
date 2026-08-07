@@ -33,10 +33,16 @@
 // BigQuery until the first Sink, which is what reconciles the real table with the
 // declaration and hands the writer the settled schema.
 //
-// Sink returns how many rows landed, and an error whenever that is fewer than it was
-// given, so that rows[n:] are exactly the ones that did not. Nothing is buffered
-// between calls: the rows handed to one Sink are the batch. Closing belongs to the
-// writer, since that is what holds a connection, and a Sinker has nothing waiting.
+// Sink returns a non-nil error whenever n is fewer than the rows it was given, so
+// that rows[n:] are exactly the ones that did not. What counts as done there is
+// the writer's own promise: how many reached BigQuery for a writer promising
+// delivery, and only how many reached its own buffer for one promising
+// acceptance instead, such as a LoadJobsWriter with LoadJobs.FlushRows set —
+// what becomes of those once a job carries them is for FlushRows or Close to
+// report, not Sink. A Sinker itself buffers nothing between calls — the rows
+// handed to one Sink are the batch — though the writer it hands them to may.
+// Closing belongs to the writer, since that is what holds a connection, and a
+// Sinker has nothing waiting.
 //
 // The Options settle how bqsink behaves around the declaration: what to do about a
 // difference between it and the real table, and what gets logged. How rows travel and
@@ -44,8 +50,8 @@
 //
 // # Declaring the columns
 //
-// A row type's struct tags describe its columns, and the per-type overrides given
-// to WithMarshalers refine how their values are written.
+// A row type's struct tags describe its columns, and the per-type overrides passed
+// to DeclarationOf or DeclarationFromMetadata refine how their values are written.
 //
 // This differs from bigquery.InferSchema in two ways that matter in practice:
 // columns are NULLABLE by default, and the "bqsink" tag is read instead of

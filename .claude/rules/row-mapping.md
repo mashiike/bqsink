@@ -4,10 +4,12 @@ paths:
   - "fields.go"
   - "schema.go"
   - "marshal.go"
+  - "maprow.go"
   - "plan_test.go"
   - "fields_test.go"
   - "schema_test.go"
   - "marshal_test.go"
+  - "maprow_test.go"
 ---
 
 # 型 → 列 / 値 → 行 の対応
@@ -29,7 +31,7 @@ paths:
 `fieldPlan.resolveType` の分岐順序は仕様である。
 
 1. `date` / `datetime` / `time` タグ（`time.Time` を TIMESTAMP 以外の列にする）
-2. 登録された `Marshalers`（`WithMarshalers`）
+2. 登録された `Marshalers`（`DeclarationOf` / `DeclarationFromMetadata` の可変長引数）
 3. 型自身の `FieldMarshaler`
 4. well-known types（`time.Time`, `civil.*`, `big.Rat`）
 5. `record` タグ（struct を RECORD にする）
@@ -82,7 +84,7 @@ paths:
 - `FieldMarshaler` は**型が自分の代わりに**実装する。レシーバが値なので型情報が不要でメソッドは2つ
 - `Marshalers` は**定義を変えられない型のために外から**登録する。`MarshalFunc[T]` の型パラメータが型情報を持つので、公開メソッドを持たない
 
-`MarshalFunc` にポインタ型 `*T` を渡すと、`lookup` が `deref` するので永久に一致しない。だから `MarshalFunc` は `buildErr` に記録して `WithMarshalers` で報告する。**コンストラクタがエラーを返せないので遅延報告になっている。**
+`MarshalFunc` にポインタ型 `*T` を渡すと、`lookup` が `deref` するので永久に一致しない。だから `MarshalFunc` は `buildErr` に記録するだけで、**コンストラクタ自身はエラーを返せない**。報告するのは `joinMarshalers` で束ねた後、`buildRowPlan`（struct 経路）または `buildMapPlan`（map 経路）がその `err()` を確認して `Declaration.err` に載せる場所——つまり `DeclarationOf` / `DeclarationFromMetadata` を呼んだ時点。**依然として即座の戻り値ではないが、報告場所は以前の「`WithMarshalers` Option が評価されるまで遅延する」経路から、`Declaration.err` が `NewSinker` から転記されて返る経路に変わった。**
 
 ## 埋め込みは `encoding/json` の規則をそのまま実装している
 
@@ -141,21 +143,35 @@ Sink(ctx, rows) → FillRow(コピー) → marshalRow → retrying{ Append }
 
 `AppendInfo` に試行回数を入れないのも同じ理由。
 
-## `FillRow` が呼ばれない2つの形を `NewSinker` で弾く
+## 値レシーバの `FillRow` を `checkRowFiller` で弾く
 
-どちらも**列が空のまま黙って通る**ので、`checkRowFiller` がエラーにしている。**検査は `NewSinker`（`resolveDeclaration`）で走る** — 2026-08-05 までは初回 `Sink` だった。
+コピーに対して呼ばれるので、書き換えたコピーが捨てられ、**列が空のまま黙って通る**。`checkRowFiller` がこれをエラーにしている。判定は「行の型（宣言がポインタなら `rt.Elem()`）へのポインタが `RowFiller` を実装している」かつ「行の型自身も実装している」= 値レシーバ。
 
-**1. 値レシーバの `FillRow`。** コピーに対して呼ばれるので、書き換えたコピーが捨てられる。判定は「行の型へのポインタが実装している」かつ「行の型自身も実装している」= 値レシーバ。行がポインタとして渡される場合は検査せず、その場合だけ**呼び出し側の値が書き換わる**（GoDoc に明記済み）。
+**検査は `Declaration` の評価時点（`declarationOf`、`DeclarationOf` から呼ばれる）で走り、`Declaration.err` として `NewSinker` から返る** — 2026-08-05 までは初回 `Sink` だった。
 
-**2. promote されない `FillRow`（`checkUnpromotedFiller`）。** `reflect.StructOf` で組んだ型に `IngestionMetadata` を埋め込んでも `FillRow` は呼ばれない。**Go は実行時に組んだ型へ、埋め込み型の値レシーバのメソッドは promote するが、ポインタレシーバのメソッドは promote しない**（2026-08-05 に実測。`reflect.StructOf` の godoc は "does not support promoted methods of embedded fields" と書いているが、値レシーバは実際に promote される）。`IngestionMetadata.FillRow` はポインタレシーバなので、`DeclarationForType` 経由の無名型では `_ingestion_*` が空のまま書かれる。
+**ポインタで宣言された行（`DeclarationOf[*T]()`）も同じ判定を受ける。これは 2026-08-06 に直したバグの結果で、以前は仕様であるかのように誤って書かれていた。** それまでの `checkRowFiller` は `rt.Kind() == reflect.Pointer` を早期 return で素通りさせ、値レシーバかどうかの検査を丸ごとバイパスしていた。`T` の `FillRow` が値レシーバでも `DeclarationOf[*T]()` と宣言すれば検査を逃れ、`_ingestion_*` などの列が空のまま黙って書かれる穴になっていた。旧版のこのファイルは「行がポインタとして渡される場合は検査せず、その場合だけ呼び出し側の値が書き換わる」とこの穴を仕様のように記述していたが誤りだった。直した後は `rt` がポインタなら先に `elem := rt.Elem()` へ剥がし、値レシーバかどうかの判定を常に `elem` に対して行う。`TestValueReceiverFillRowIsRejectedThroughAPointerDeclaration` がこの回帰を守っている。
 
-判定は「`*rt` が `RowFiller` を実装していない」かつ「直下に埋め込まれた型が実装している」。**この条件だと false positive が原理的に出ない**: promote が効いていれば `*rt` が実装しているので到達しない。コンパイル時の型（普通の struct）は全部 promote されるので影響を受けない。
+ポインタ宣言でポインタレシーバの `FillRow` を実装している通常のケース（`*AccessLog` が `*T` として `RowFiller` を実装する場合）はこの検査を素直に通り、`fillable` が呼び出し側のポインタをそのまま返すので**呼び出し側の値まで書き換わる**（`RowFiller` の GoDoc に明記済み、`TestPointerTypeParameterCanFill` が守る）。
 
-**ポインタで宣言された行（`DeclarationForType(reflect.PointerTo(rt))`）も同じ検査を通す。** 2026-08-05 のレビューで、`rt.Kind() == reflect.Pointer` の早期 return が検査を丸ごとバイパスしていた穴を実測で指摘され、`rt.Elem()` に対して検査する形に直した。**`reflect.StructOf` で作った型は、そのポインタにも埋め込みメソッドを promote しない**（値レシーバでも）ので、ポインタで渡せば通る、という抜け道を塞いでいる。普通の `*AccessLog` は `*T` が `RowFiller` を実装するので早期 return のまま。
-
-深さ1の埋め込みしか見ていない。宣言は直下に書くものなので足りている。
+`reflect.StructOf` 経路（`DeclarationForType`）は 2026-08-06 に廃止され、実行時スキーマは `DeclarationFromMetadata`（`map[string]any` 行、データ駆動）に一本化された。これにより `checkUnpromotedFiller` が対処していた問題の発生源が消え、関数自体も削除された。
 
 **コピーを作るのは `fillable`**（`bqsink.go`）で、値なら `reflect.New(v.Type())` + `Elem().Set(v)`、ポインタならそのポインタを返す。`prepare` はその戻り値に対して `RowFiller` をアサートするので、アクセサを組み立てる関数は存在しない（`fillerFunc` は 2026-08-04 に削除した）。
+
+## `map[string]any` 行の値ディスパッチ順（`maprow.go`）
+
+`DeclarationFromMetadata` は行を `map[string]any` に固定し、スキーマを `*bigquery.TableMetadata` から読む。`rowPlan` と違って歩く Go struct が無いので、`mapPlan` は列を Go の型からではなく `bigquery.Schema` から作る。**`RowFiller` はここでは効かない** — `map[string]any` は名前を持たないのでメソッドを実装できず、`DeclarationFromMetadata` は `fills` を立てない（`checkRowFiller` もそもそも呼ばれない）。行に自前の ingestion 列を持たせたい場合は `Sink` の前に呼び出し側が直接 map へ詰める。
+
+`mapPlan.marshalScalar` が1つの非 nil 値をディスパッチする順序は仕様である:
+
+1. 登録された `Marshalers`（値の**動的型**で引く。struct 経路の `fieldPlan.resolveType` は静的なフィールド型で引くのに対し、map の値は `any` なので動的型しか引ける手がかりがない）
+2. 値自身の `FieldMarshaler`
+3. 受理表（`reflect.Kind` ベース）。struct 経路と同じく named type（`type Env string` 等）も受理するが、`time.Time` / `civil.Date` / `civil.Time` / `civil.DateTime` / `*big.Rat` / `map[string]any` は型アサーションで厳密な型のまま受理する
+
+**1・2 の変換結果が宣言列の `FieldType` と食い違ったらエラーにする。** struct 経路の既存エンコーダには無い検査で、map 経路で新設した。schema が run time に確定するので、`Marshalers` や `FieldMarshaler` の宣言と食い違ったまま書き込む経路を作らないため。
+
+**REPEATED 列の要素が nil だとエラーにする。列自体が nil なら NULL のまま。** BigQuery は要素に NULL を持つ配列の書き込みを "Array cannot have a null element" として拒否することを実測で確認済み（クエリの中間値としては `ARRAY_LENGTH` がその NULL 要素も数えるが、それとは非対称）。列自体の nil 判定（`marshalField`）と要素の nil 判定（`marshalRepeated`）が別の関数になっているのはこの区別のため。
+
+詳細（`marshalAccepted` の型ごとの分岐、`marshalInteger` の範囲チェック等）は `maprow.go` を読むこと。
 
 ## `_ingestion_` プレフィックスは実測で通ることを確認済み
 

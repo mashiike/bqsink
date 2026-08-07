@@ -39,8 +39,8 @@ type FieldMarshaler interface {
 	MarshalBigQueryValue() (bigquery.Value, error)
 }
 
-// Marshalers is a list of per-type overrides, built with MarshalFunc and handed
-// to WithMarshalers.
+// Marshalers is a list of per-type overrides, built with MarshalFunc and passed
+// to DeclarationOf or DeclarationFromMetadata.
 //
 // Despite the name it is not a collection of FieldMarshaler. FieldMarshaler is
 // implemented by a type on its own behalf; Marshalers registers mappings from the
@@ -70,9 +70,10 @@ type typeMarshaler struct {
 // RECORD is not a usable fieldType, because its nested schema cannot be derived
 // from a field type alone; spell such a column out in BigQueryTableMetadata.
 //
-// A problem with the arguments is reported when the result reaches
-// WithMarshalers, since a constructor cannot return an error and stay usable
-// inline.
+// A problem with the arguments is reported when DeclarationOf or
+// DeclarationFromMetadata evaluates the declaration, since a constructor cannot
+// return an error and stay usable inline; it surfaces from NewSinker as the
+// Declaration's own error.
 func MarshalFunc[T any](fieldType bigquery.FieldType, fn func(T) (bigquery.Value, error)) *Marshalers {
 	goType := reflect.TypeFor[T]()
 	if goType.Kind() == reflect.Pointer {

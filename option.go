@@ -28,7 +28,6 @@ func validateStrategy(name string, s any) error {
 }
 
 type config struct {
-	marshalers     *Marshalers
 	strategy       MigrationStrategy
 	migrationRetry func() gax.Retryer
 	logger         *slog.Logger
@@ -46,33 +45,6 @@ type config struct {
 // The Options here settle how bqsink behaves around that declaration: what to do
 // about a difference from the real table, and what gets logged.
 type Option func(*config) error
-
-// WithMarshalers registers per-type overrides of how a Go type becomes a
-// BigQuery column, built with MarshalFunc.
-//
-// They apply both to the schema derived from the row type's struct tags and to the values
-// written, and they win over a type's own FieldMarshaler. Registering the same Go
-// type more than once keeps the mapping registered last.
-//
-// This is not a way to describe the table from outside the row type. It exists because a
-// field's type may come from another package, which cannot be given a
-// FieldMarshaler method: the mapping is about encoding a value, not about what the
-// table holds. Where a TableDefiner supplies the schema outright the overrides do
-// not reach it, since nothing is derived in that case, and they still decide how
-// the values are written.
-func WithMarshalers(marshalers ...*Marshalers) Option {
-	return func(c *config) error {
-		joined := joinMarshalers(marshalers)
-		if joined == nil {
-			return errors.New("bqsink: WithMarshalers: no marshaler was given")
-		}
-		if c.marshalers == nil {
-			c.marshalers = &Marshalers{}
-		}
-		c.marshalers.merge(joined)
-		return nil
-	}
-}
 
 // WithMigrationStrategy selects the migration strategy and how the migration retries.
 //

@@ -262,24 +262,19 @@ func TestValueReceiverFillRowIsRejected(t *testing.T) {
 	}
 }
 
-// TestUnpromotedFillRowIsRejected checks the other shape checkRowFiller turns down:
-// a type built at run time with reflect.StructOf. Go promotes an embedded type's
-// value receiver methods to such a type but not a pointer receiver's, so embedding
-// IngestionMetadata this way would otherwise leave its columns silently empty.
-func TestUnpromotedFillRowIsRejected(t *testing.T) {
+// TestValueReceiverFillRowIsRejectedThroughAPointerDeclaration checks the pointer
+// side of the same rejection: DeclarationOf[*valueReceiverRow]() names a pointer
+// type whose promoted FillRow is still valueReceiverRow's value receiver, so
+// filling would land on a copy just as it would for the non-pointer declaration.
+func TestValueReceiverFillRowIsRejectedThroughAPointerDeclaration(t *testing.T) {
 	t.Parallel()
 
-	rt := reflect.StructOf([]reflect.StructField{
-		{Name: "IngestionMetadata", Type: reflect.TypeFor[IngestionMetadata](), Anonymous: true},
-		{Name: "UserID", Type: reflect.TypeFor[string](), Tag: `bqsink:"user_id"`},
-	})
-
-	_, err := NewSinker(newFakeWriter(t), DeclarationForType(rt))
+	_, err := testSinker[*valueReceiverRow](t)
 	if err == nil {
-		t.Fatal("NewSinker() error = nil, want a rejection of the unpromoted FillRow")
+		t.Fatal("NewSinker() error = nil, want a rejection of the value receiver")
 	}
-	if !strings.Contains(err.Error(), "does not promote its FillRow") {
-		t.Errorf("NewSinker() error = %v, want it to name the unpromoted FillRow", err)
+	if !strings.Contains(err.Error(), "pointer receiver") {
+		t.Errorf("NewSinker() error = %v, want it to say a pointer receiver is needed", err)
 	}
 }
 
@@ -483,25 +478,6 @@ func TestRetryKeepsTheSameRowID(t *testing.T) {
 	}
 	if !strings.Contains(calls[1].rows, "_ingestion_row_id") {
 		t.Errorf("the rows loaded carry no _ingestion_row_id: %q", calls[1].rows)
-	}
-}
-
-// TestUnpromotedFillRowIsRejectedForAPointerRow covers the same silent miss as
-// TestUnpromotedFillRowIsRejected for a row declared as a pointer. A type built at
-// run time promotes nothing to its pointer either, so FillRow would never run.
-func TestUnpromotedFillRowIsRejectedForAPointerRow(t *testing.T) {
-	t.Parallel()
-
-	rt := reflect.StructOf([]reflect.StructField{
-		{Name: "IngestionMetadata", Type: reflect.TypeOf(IngestionMetadata{}), Anonymous: true},
-		{Name: "Name", Type: reflect.TypeOf(""), Tag: `bqsink:"name"`},
-	})
-	_, err := NewSinker(newFakeWriter(t), DeclarationForType(reflect.PointerTo(rt)))
-	if err == nil {
-		t.Fatal("NewSinker() error = nil, want a row whose FillRow is not promoted to be refused")
-	}
-	if !strings.Contains(err.Error(), "does not promote its FillRow") {
-		t.Errorf("NewSinker() error = %v, want it to say why FillRow would never run", err)
 	}
 }
 

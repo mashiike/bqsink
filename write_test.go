@@ -488,19 +488,30 @@ func TestNewWriterSettlesTheRelation(t *testing.T) {
 	}
 }
 
-// TestConcurrentSinksShareOneWriterSafely checks the writer under the only
-// arrangement where FlushRows gathers rows across calls: several goroutines
-// sinking at once, each waiting for the batch its rows joined.
+// TestConcurrentSinksAcceptEveryRowAndDeliverItExactlyOnce checks the writer
+// under the only arrangement where FlushRows gathers rows across calls:
+// several goroutines sinking through one shared LoadJobsWriter at once.
 //
-// How many jobs that ends up being depends on the interleaving, so what is
-// checked is what has to hold whatever happens — every row lands exactly once,
-// and no job carries more rows than were written.
-func TestConcurrentSinksShareOneWriterSafely(t *testing.T) {
+// Acceptance resolves the moment WriteRows returns: whichever goroutine
+// happens to fill the buffer to FlushRows submits it synchronously and
+// blocks until that job finishes, but every goroutine's WriteResult —
+// including that one's — was already resolved with acceptance before its
+// call returned. So counts[i] only checks that every goroutine's row was
+// taken into the buffer, not that it was delivered; delivery is what the
+// loader is checked for below, once every goroutine and the Close after them
+// have finished.
+//
+// With goroutines chosen to divide evenly by FlushRows, the number of load
+// jobs does not depend on how the goroutines happen to interleave: mu
+// serializes every append and threshold check into one total order, so the
+// buffer fills exactly goroutines/flushRows times whatever that order is.
+func TestConcurrentSinksAcceptEveryRowAndDeliverItExactlyOnce(t *testing.T) {
 	t.Parallel()
 
 	const goroutines = 8
+	const flushRows = 4
 	loader := &fakeLoader{}
-	w, err := (&LoadJobs{FlushRows: 4}).NewWriter(testClient(t), testRelation())
+	w, err := (&LoadJobs{FlushRows: flushRows}).NewWriter(testClient(t), testRelation())
 	if err != nil {
 		t.Fatalf("NewWriter() error = %v", err)
 	}
@@ -529,21 +540,22 @@ func TestConcurrentSinksShareOneWriterSafely(t *testing.T) {
 			t.Fatalf("Sink() from goroutine %d error = %v", i, err)
 		}
 		if counts[i] != 1 {
-			t.Errorf("Sink() from goroutine %d n = %d, want 1", i, counts[i])
+			t.Errorf("Sink() from goroutine %d n = %d, want 1 (acceptance, not delivery)", i, counts[i])
 		}
 	}
 	if err := w.Close(t.Context()); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
+	calls := loader.snapshot()
 	var lines int
-	for _, call := range loader.snapshot() {
+	for _, call := range calls {
 		lines += strings.Count(call.rows, "\n")
 	}
 	if lines != goroutines {
 		t.Errorf("%d row(s) reached a load job, want %d: every row has to land exactly once", lines, goroutines)
 	}
-	if jobs := len(loader.snapshot()); jobs > goroutines {
-		t.Errorf("%d load job(s) were submitted for %d calls, want no more than one each", jobs, goroutines)
+	if jobs, want := len(calls), goroutines/flushRows; jobs != want {
+		t.Errorf("%d load job(s) were submitted, want exactly %d", jobs, want)
 	}
 }
 

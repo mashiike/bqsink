@@ -552,7 +552,28 @@ func (s *Sinker) newTableMetadata() *bigquery.TableMetadata {
 		md = &copied
 	}
 	md.Schema = s.schema
+	clearReadOnlyTableMetadata(md)
 	return md
+}
+
+// clearReadOnlyTableMetadata zeroes the fields BigQuery populates itself.
+// DeclarationFromMetadata's natural input is a table's own fetched metadata,
+// which carries them, and TableDefiner's GoDoc already promises they are
+// ignored; Create is where that promise has to be kept, since
+// bigquery.TableMetadata carries no separate type for what may be created
+// from what may only be read.
+func clearReadOnlyTableMetadata(md *bigquery.TableMetadata) {
+	md.FullID = ""
+	md.Type = ""
+	md.CreationTime = time.Time{}
+	md.LastModifiedTime = time.Time{}
+	md.NumBytes = 0
+	md.NumLongTermBytes = 0
+	md.NumRows = 0
+	md.SnapshotDefinition = nil
+	md.CloneDefinition = nil
+	md.StreamingBuffer = nil
+	md.ETag = ""
 }
 
 func (s *Sinker) patchSchema(ctx context.Context, md *bigquery.TableMetadata, change SchemaChange) error {

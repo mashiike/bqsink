@@ -49,9 +49,9 @@ type everythingRow struct {
 
 func everythingSinker(t *testing.T) *Sinker {
 	t.Helper()
-	s, err := testSinker[everythingRow](t, WithMarshalers(jsonMarshalers()))
+	s, err := NewSinker(newFakeWriter(t), DeclarationOf[everythingRow](jsonMarshalers()))
 	if err != nil {
-		t.Fatalf("testSinker() error = %v", err)
+		t.Fatalf("NewSinker() error = %v", err)
 	}
 	return s
 }
@@ -284,12 +284,12 @@ func TestTimeColumnOptionConflictingWithAMarshalerIsRejected(t *testing.T) {
 	m := MarshalFunc(bigquery.StringFieldType, func(v time.Time) (bigquery.Value, error) {
 		return v.Format(time.RFC3339), nil
 	})
-	_, err := inferSchema[timeColumnRow](m)
+	_, err := NewSinker(newFakeWriter(t), DeclarationOf[timeColumnRow](m))
 	if err == nil {
-		t.Fatal("inferSchema() error = nil, want the contradiction to be rejected")
+		t.Fatal("NewSinker() error = nil, want the contradiction to be rejected")
 	}
 	if !strings.Contains(err.Error(), "drop one of them") {
-		t.Errorf("inferSchema() error = %v, want it to say the two disagree", err)
+		t.Errorf("NewSinker() error = %v, want it to say the two disagree", err)
 	}
 }
 

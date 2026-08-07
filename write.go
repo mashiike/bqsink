@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/bigquery"
@@ -62,8 +61,7 @@ type RowsWriter interface {
 	// WriteRows hands rows over and returns what will say whether they landed.
 	//
 	// A non-nil error means the rows were not taken at all. Otherwise they are the
-	// writer's until the WriteResult settles, and a writer that buffers may keep
-	// them past this call.
+	// writer's, and a writer that buffers may keep them past this call.
 	WriteRows(ctx context.Context, rows []Row) (WriteResult, error)
 
 	// Close releases what the writer holds, having settled the rows it still has.
@@ -72,21 +70,34 @@ type RowsWriter interface {
 	Close(ctx context.Context) error
 }
 
-// WriteResult says whether the rows of one WriteRows reached BigQuery.
+// WriteResult says what the writer that returned it is promising about the rows
+// of that call, and the promise is not the same for every writer.
+//
+// A writer that sends rows itself and waits for BigQuery to accept them, such as
+// StorageWriter, promises delivery: its WriteResult is not resolved until Wait
+// is called, and n then says how many of the rows landed.
+//
+// A writer that instead buffers rows of its own, such as LoadJobsWriter with
+// LoadJobs.FlushRows set, promises acceptance: its WriteResult is already
+// resolved by the time WriteRows returns, and n says how many rows were taken
+// into the buffer, not how many have landed. What becomes of them once a job
+// carries them is FlushRows's or Close's to report, not this WriteResult's.
+//
+// A LoadJobsWriter with FlushRows unset submits a job for every call's rows on
+// the spot, so its WriteResult promises delivery too, already resolved with
+// that job's outcome by the time WriteRows returns.
+//
+// Whichever it promises, a WriteResult that reports fewer rows than were placed
+// in its care always comes with a non-nil error, whether those rows were handed
+// to WriteRows or held in a buffer FlushRows submits.
 type WriteResult interface {
-	// Wait returns how many of that call's rows landed, and a non-nil error
-	// whenever that is fewer than the call was given, so that rows[n:] of it are
-	// exactly the rows that did not land.
+	// Wait returns what the WriteResult above promises. A result already
+	// resolved returns it at once; a writer that defers delivery, such as
+	// StorageWriter, has Wait do the waiting.
 	//
-	// Waiting is also what sends rows a buffering transport still holds, which is
-	// the choice it offers: wait at once to know they landed, or wait later to let
-	// more rows share one job.
-	//
-	// Cancelling ctx does not take the rows back, and where the transport gathers
-	// rows from several calls it does not stop the job either: whichever call sends
-	// a batch lends the job its own ctx, so cancelling that one fails the batch for
-	// everyone whose rows are in it. A caller that cannot afford that gives every
-	// Sink the same ctx, or writes without FlushRows so that no batch is shared.
+	// Cancelling ctx before a deferred result resolves reports that
+	// cancellation rather than the rows' actual fate, and does not take the rows
+	// back: they may still land.
 	Wait(ctx context.Context) (n int, err error)
 }
 
@@ -95,6 +106,17 @@ type WriteResult interface {
 type LoggerBindable interface {
 	BindLogger(logger *slog.Logger)
 }
+
+// Flusher is implemented by a writer that buffers rows of its own, letting a
+// caller send what it holds without waiting for enough rows to arrive on
+// their own.
+type Flusher interface {
+	// FlushRows submits the rows buffered so far as one job and returns a
+	// WriteResult already resolved with the outcome.
+	FlushRows(ctx context.Context) (WriteResult, error)
+}
+
+var _ Flusher = (*LoadJobsWriter)(nil)
 
 // ResolvedResult returns a WriteResult that has already settled, which is what a
 // transport writing its rows before it returns hands back.
@@ -146,25 +168,24 @@ type LoadJobs struct {
 	// its backoff and cannot be reused.
 	RetryPolicy func() gax.Retryer
 
-	// FlushRows gathers rows across calls and submits them as one load job once
-	// this many are held, rather than submitting a job per WriteRows. A table's
-	// daily job quota is what makes that worth doing: writing a row at a time
-	// without it submits a load job each time.
+	// FlushRows gathers rows across calls into a buffer and submits them as one
+	// load job once this many are held, rather than submitting a job per
+	// WriteRows. A table's daily job quota is what makes that worth doing:
+	// writing a row at a time without it submits a load job each time.
 	//
-	// The zero value submits a job per WriteRows.
+	// The zero value submits a job per WriteRows, and that call's WriteResult
+	// reports the job's own outcome.
 	//
-	// Waiting on a WriteResult submits the batch its rows are in, so what a batch
-	// ends up carrying depends on when the rows are waited for. Several goroutines
-	// writing at once share a job, which each of them then waits for: the rows of
-	// every call that joined the batch before one of them waited travel together,
-	// and none of the calls gives up its own answer for it. One goroutine waiting
-	// on each call in turn gets a job per call, since there is nobody else to
-	// gather rows from; it is Flush that gathers rows for a caller like that, or
-	// waiting on the results later rather than at once.
+	// With FlushRows set, WriteRows itself only ever reports that the rows were
+	// taken into the buffer, not that a job has run. A submission triggered by
+	// the buffer reaching this many rows, or one a later call to FlushRows or
+	// Close makes, is reported by whichever of those methods makes it, not by
+	// the WriteResult of the WriteRows call that filled the buffer.
 	//
-	// A batch reaching this many rows is submitted by the call that filled it,
-	// which is what keeps the rows held here bounded, and Flush or Close submits
-	// what is left.
+	// A buffer reaching this many rows is submitted by the call that filled it,
+	// which is what keeps the rows held here bounded, and FlushRows or Close
+	// submits what is left. The call that fills the buffer blocks until that
+	// job finishes, under RetryPolicy, before returning.
 	FlushRows int
 }
 
@@ -221,17 +242,18 @@ func (w *LoadJobs) NewWriter(client *bigquery.Client, relation Relation) (*LoadJ
 	}, nil
 }
 
-// LoadJobsWriter writes rows with BigQuery load jobs.
+// LoadJobsWriter writes rows to one BigQuery table with load jobs.
 //
-// Where FlushRows asks for it, rows gather here until a job's worth of them has
-// arrived. What that means for a caller is settled by when it waits on the
-// WriteResults: waiting at once submits a job per call, and waiting later lets
-// the rows of several calls travel together.
+// Its WriteRows never defers what it reports: with LoadJobs.FlushRows unset, it
+// submits a load job for the call's own rows on the spot and reports that job's
+// outcome. With FlushRows set, it instead reports that the rows were accepted
+// into a buffer held here, and what becomes of them once a job carries them is
+// FlushRows's or Close's to report, not WriteRows's.
 //
-// Nothing is serialised on a lock while a job runs, so concurrent calls submit
-// concurrent jobs, and a job carries the rows of every call that filled its
-// batch. A failure is reported to each of those calls, and to Close when no
-// caller ever asked.
+// A buffer reaching FlushRows is submitted by the call that filled it, which is
+// what keeps the rows held here bounded. A failure of that submission is kept
+// until FlushRows or Close next runs, rather than handed to any particular
+// caller.
 type LoadJobsWriter struct {
 	relation    Relation
 	client      *bigquery.Client
@@ -239,45 +261,17 @@ type LoadJobsWriter struct {
 	retryPolicy func() gax.Retryer
 	flushRows   int
 
-	mu       sync.Mutex
-	idle     *sync.Cond
-	inflight int
-	logger   *slog.Logger
-	schema   bigquery.Schema
-	open     *loadBatch
-	failed   []*loadBatch
-	closed   bool
-}
+	mu      sync.Mutex
+	logger  *slog.Logger
+	schema  bigquery.Schema
+	buf     []Row
+	pending []error
+	closed  bool
 
-// settled returns the condition Close waits on for the jobs still running. It is
-// made on first use so that a writer built as a struct literal, which the tests
-// do, needs nothing of the sort. Its caller holds mu, which is what it guards.
-func (w *LoadJobsWriter) settled() *sync.Cond {
-	if w.idle == nil {
-		w.idle = sync.NewCond(&w.mu)
-	}
-	return w.idle
-}
-
-// loadBatch is the rows of one load job, shared by the WriteResults of every
-// WriteRows that put rows in it.
-//
-// claimed is what keeps a batch to one job: whoever wins it submits, and everyone
-// else waits for done. err is only read once done is closed.
-//
-// unread counts the WriteResults of this batch that have not reported its outcome
-// yet, so that a failure is still Close's to report while any one of the calls that
-// filled the batch has not asked. One caller waiting does not answer for another.
-type loadBatch struct {
-	rows    []Row
-	claimed atomic.Bool
-	done    chan struct{}
-	err     error
-	unread  atomic.Int32
-}
-
-func newLoadBatch() *loadBatch {
-	return &loadBatch{done: make(chan struct{})}
+	// wg lets Close wait for a submission still in flight rather than return
+	// before it lands. See .claude/rules/transports.md for the Add/Wait
+	// ordering this depends on.
+	wg sync.WaitGroup
 }
 
 // Relation implements RowsWriter.
@@ -310,9 +304,17 @@ func (w *LoadJobsWriter) BindSchema(_ context.Context, schema bigquery.Schema) e
 
 // WriteRows implements RowsWriter.
 //
-// The rows join the batch being gathered, and the result returned settles when
-// that batch's load job has finished. A batch reaching FlushRows is submitted by
-// the call that filled it, so the rows held here stay bounded.
+// With LoadJobs.FlushRows unset, it submits a load job for these rows on the
+// spot, under RetryPolicy, and the WriteResult it returns is already resolved
+// with that job's outcome.
+//
+// With FlushRows set, it appends the rows to the buffer and returns a
+// WriteResult resolved with their acceptance: len(rows) and a nil error,
+// whether or not the append goes on to submit a job. When appending fills the
+// buffer to FlushRows, this call also submits it on the spot, under
+// RetryPolicy, and blocks until that job finishes before returning, but a
+// failure of that submission is kept for FlushRows or Close to report rather
+// than reflected in the WriteResult returned here.
 func (w *LoadJobsWriter) WriteRows(ctx context.Context, rows []Row) (WriteResult, error) {
 	if len(rows) == 0 {
 		return ResolvedResult(0, nil), nil
@@ -320,138 +322,140 @@ func (w *LoadJobsWriter) WriteRows(ctx context.Context, rows []Row) (WriteResult
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
-		return nil, errors.New("bqsink: LoadJobsWriter: the writer is closed")
+		return nil, fmt.Errorf("bqsink: LoadJobsWriter: %w", ErrWriterClosed)
 	}
 	if w.schema == nil {
 		w.mu.Unlock()
 		return nil, errors.New("bqsink: LoadJobsWriter: no schema is bound yet")
 	}
-	if w.open == nil {
-		w.open = newLoadBatch()
-	}
-	batch := w.open
-	batch.rows = append(batch.rows, rows...)
-	batch.unread.Add(1)
-	result := &loadResult{writer: w, batch: batch, rows: len(rows)}
-	if len(batch.rows) < w.flushRows {
+	schema, logger := w.schema, w.logger
+	if w.flushRows == 0 {
 		w.mu.Unlock()
-		return result, nil
+		if err := w.load(ctx, rows, schema, logger); err != nil {
+			return ResolvedResult(0, err), nil
+		}
+		return ResolvedResult(len(rows), nil), nil
 	}
-	w.open = nil
+	w.buf = append(w.buf, rows...)
+	var batch []Row
+	if len(w.buf) >= w.flushRows {
+		batch = w.buf
+		w.buf = nil
+		w.wg.Add(1)
+	}
 	w.mu.Unlock()
-	w.submit(ctx, batch)
-	return result, nil
+	if batch != nil {
+		defer w.wg.Done()
+		if err := w.load(ctx, batch, schema, logger); err != nil {
+			w.mu.Lock()
+			w.pending = append(w.pending, fmt.Errorf("bqsink: %d row(s) did not land: %w", len(batch), err))
+			w.mu.Unlock()
+		}
+	}
+	return ResolvedResult(len(rows), nil), nil
 }
 
-// Flush submits the rows FlushRows is holding back, without waiting on each
-// WriteResult in turn. It is what a caller gathering rows over time calls, from a
-// ticker or once a batch is worth sending.
+// FlushRows implements Flusher. It submits whatever rows the buffer holds as
+// one load job, under RetryPolicy, and returns a WriteResult already resolved
+// with that job's outcome: n is how many of the rows this call itself sent
+// landed, which is 0 when the job fails.
 //
-// It returns the load job's error, which is the same one the WriteResults of the
-// rows it sent report.
-func (w *LoadJobsWriter) Flush(ctx context.Context) error {
+// A submission WriteRows made on its own, by filling the buffer to FlushRows,
+// is not reported when it happens: that call's own WriteResult already
+// reported acceptance. Its outcome is kept until the next call to FlushRows or
+// to Close, which folds it into the error returned here and then clears it, so
+// it is reported exactly once — and only there: a caller that lets this
+// WriteResult go without calling Wait on it loses that outcome for good, even
+// though the rows behind it were never this call's own to report. Unlike
+// Close, FlushRows does not wait for a submission still in flight, so that
+// outcome may instead be left for whichever of the two runs next.
+//
+// The outcome of this call's own submission, in contrast, is carried solely by
+// the WriteResult returned here: it is never folded into pending, so it is
+// never reported by a later FlushRows or by Close either. A caller that lets
+// this WriteResult go without calling Wait on it has no way left to learn
+// whether these rows landed.
+func (w *LoadJobsWriter) FlushRows(ctx context.Context) (WriteResult, error) {
 	w.mu.Lock()
-	batch := w.open
-	w.open = nil
-	w.mu.Unlock()
-	if batch == nil {
-		return nil
+	if w.closed {
+		w.mu.Unlock()
+		return nil, fmt.Errorf("bqsink: LoadJobsWriter: %w", ErrWriterClosed)
 	}
-	return w.sendAndWait(ctx, batch)
+	batch := w.buf
+	w.buf = nil
+	pending := w.pending
+	w.pending = nil
+	schema, logger := w.schema, w.logger
+	if len(batch) > 0 {
+		w.wg.Add(1)
+	}
+	w.mu.Unlock()
+
+	n := 0
+	var jobErr error
+	if len(batch) > 0 {
+		defer w.wg.Done()
+		if err := w.load(ctx, batch, schema, logger); err != nil {
+			jobErr = fmt.Errorf("bqsink: %d row(s) did not land: %w", len(batch), err)
+		} else {
+			n = len(batch)
+		}
+	}
+	err := jobErr
+	if len(pending) > 0 {
+		err = errors.Join(append(pending, jobErr)...)
+	}
+	return ResolvedResult(n, err), nil
 }
 
-// Close submits what is still held and reports what nothing else would.
+// Close waits for a submission still in flight, whether WriteRows started it
+// on its own by filling the buffer to FlushRows or a FlushRows call started
+// it, then submits whatever the buffer still holds and releases the writer.
+// Closing twice in sequence is harmless: the second call finds nothing left to
+// submit or report and returns nil. Two concurrent calls are not so evenly
+// matched: whichever observes the writer already closed returns nil at once,
+// without waiting for the other to finish, so it learns nothing about the
+// outcome that call goes on to report.
 //
-// Two things are reported here. Rows FlushRows was holding back are sent, since
-// closing is the last chance to send them. And a load job that failed goes into
-// the error too while any of the calls whose rows were in it has not waited on its
-// WriteResult, because that call would otherwise never be told. One caller waiting
-// does not answer for another sharing the batch, so the same failure can reach both
-// a Wait and Close.
+// ctx bounds only the submission this call makes of whatever the buffer still
+// holds; it does not bound the wait for a submission already in flight, so
+// Close can run past ctx's own deadline if that submission is retrying under
+// a RetryPolicy with no bound of its own.
 //
-// A job another goroutine is still running is waited for first, so that its
-// outcome is not missed by closing at the wrong moment. Closing twice is harmless.
+// What it folds into the error it returns, though, is narrower than what it
+// waits for: only a WriteRows submission's outcome is kept in pending, so
+// only that is reported here. A FlushRows call's own submission is never
+// folded into pending; its outcome was carried solely by the WriteResult that
+// call returned, and if nothing ever called Wait on it, Close does not
+// recover it either — that outcome is lost to every caller, not just the one
+// that made the FlushRows call.
 func (w *LoadJobsWriter) Close(ctx context.Context) error {
 	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return nil
+	}
 	w.closed = true
-	batch := w.open
-	w.open = nil
+	batch := w.buf
+	w.buf = nil
+	schema, logger := w.schema, w.logger
+	w.mu.Unlock()
+
+	w.wg.Wait()
+
+	w.mu.Lock()
+	pending := w.pending
+	w.pending = nil
 	w.mu.Unlock()
 
 	var errs []error
-	if batch != nil {
-		if err := w.sendAndWait(ctx, batch); err != nil {
-			errs = append(errs, err)
+	errs = append(errs, pending...)
+	if len(batch) > 0 {
+		if err := w.load(ctx, batch, schema, logger); err != nil {
+			errs = append(errs, fmt.Errorf("bqsink: %d row(s) did not land: %w", len(batch), err))
 		}
 	}
-	w.mu.Lock()
-	// A job another goroutine started is waited for here rather than left behind:
-	// its failure reaches w.failed only when it finishes, and a Close that returned
-	// before then would be the last chance to report it going by unnoticed.
-	for w.inflight > 0 {
-		w.settled().Wait()
-	}
-	unread := retainUnread(w.failed)
-	w.failed = nil
-	w.mu.Unlock()
-	for _, b := range unread {
-		errs = append(errs, fmt.Errorf("bqsink: %d row(s) did not land and their result was never waited for: %w",
-			len(b.rows), b.err))
-	}
 	return errors.Join(errs...)
-}
-
-// settle sends the batch if it is still gathering rows and returns its outcome,
-// which is what a WriteResult reports.
-func (w *LoadJobsWriter) settle(ctx context.Context, batch *loadBatch) error {
-	w.mu.Lock()
-	if w.open == batch {
-		// No more rows join a batch on its way out.
-		w.open = nil
-	}
-	w.mu.Unlock()
-	return w.sendAndWait(ctx, batch)
-}
-
-// sendAndWait submits the batch unless someone else already is, and then waits
-// for whoever did.
-func (w *LoadJobsWriter) sendAndWait(ctx context.Context, batch *loadBatch) error {
-	w.submit(ctx, batch)
-	select {
-	case <-batch.done:
-		return batch.err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// submit runs the batch's load job, once. A caller that does not win the batch
-// returns straight away and waits for the one that did.
-func (w *LoadJobsWriter) submit(ctx context.Context, batch *loadBatch) {
-	if !batch.claimed.CompareAndSwap(false, true) {
-		return
-	}
-	w.mu.Lock()
-	schema, logger := w.schema, w.logger
-	w.inflight++
-	w.mu.Unlock()
-	err := w.load(ctx, batch.rows, schema, logger)
-	// Settled before the batch is put anywhere anyone else can reach it, so that
-	// Close never reads the outcome of a batch that has none yet, and closing done
-	// last is what releases the waiters.
-	batch.err = err
-	w.mu.Lock()
-	if err != nil {
-		// Kept so that Close can report a failure no WriteResult was ever asked
-		// about. Batches every result has read are dropped rather than piling up.
-		w.failed = append(retainUnread(w.failed), batch)
-	}
-	w.inflight--
-	if w.inflight == 0 {
-		w.settled().Broadcast()
-	}
-	w.mu.Unlock()
-	close(batch.done)
 }
 
 func (w *LoadJobsWriter) load(ctx context.Context, rows []Row, schema bigquery.Schema, logger *slog.Logger) error {
@@ -470,58 +474,6 @@ func (w *LoadJobsWriter) load(ctx context.Context, rows []Row, schema bigquery.S
 	return retrying(ctx, logger, "load", w.retryPolicy, func(ctx context.Context) error {
 		return w.loader.load(ctx, buf.Bytes(), schema, logger)
 	})
-}
-
-// retainUnread drops the batches every WriteResult of which has reported the
-// outcome, leaving the ones somebody was never told about.
-func retainUnread(batches []*loadBatch) []*loadBatch {
-	kept := batches[:0]
-	for _, b := range batches {
-		if b.unread.Load() > 0 {
-			kept = append(kept, b)
-		}
-	}
-	return kept
-}
-
-// loadResult reports the outcome of the batch its rows went into.
-//
-// read keeps this one call's share of the batch's unread count to a single
-// decrement, so that waiting twice does not make Close think another caller has
-// been told.
-type loadResult struct {
-	writer *LoadJobsWriter
-	batch  *loadBatch
-	rows   int
-	read   atomic.Bool
-}
-
-// Wait implements WriteResult. It submits the batch these rows are in when
-// nothing else has, which is what makes waiting at once equivalent to writing
-// without a buffer at all.
-func (r *loadResult) Wait(ctx context.Context) (int, error) {
-	err := r.writer.settle(ctx, r.batch)
-	if err != nil && ctx.Err() != nil && !isBatchSettled(r.batch) {
-		// The wait gave up rather than the batch, so this call has not been told
-		// what became of its rows and Close still owes it an answer.
-		return 0, err
-	}
-	if r.read.CompareAndSwap(false, true) {
-		r.batch.unread.Add(-1)
-	}
-	if err != nil {
-		return 0, err
-	}
-	return r.rows, nil
-}
-
-func isBatchSettled(batch *loadBatch) bool {
-	select {
-	case <-batch.done:
-		return true
-	default:
-		return false
-	}
 }
 
 // jobLoader submits the rows and waits for BigQuery to finish. It exists so that

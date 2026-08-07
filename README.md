@@ -58,15 +58,23 @@ Building takes two steps: a **writer** for the transport (`LoadJobs` here; see
 the writer, since that is what holds a connection — a `Sinker` buffers nothing of
 its own to flush and so has no `Close`.
 
-`Sink` hands the rows it is given to the writer and waits for the result, so
-nothing is buffered inside the `Sinker` itself: **the rows it is given are the
-batch handed to the writer.** What the writer then does with that batch is its own
-business — `LoadJobs.FlushRows` can hold rows back across calls, for instance (see
-[Flushing rows](#flushing-rows)). `Sink` returns how many rows landed, and a
-non-nil error whenever that is fewer than it was given: `rows[n:]` are exactly the
-ones that did not make it, and nothing else records them. Give it a whole batch
-rather than one row at a time, especially with `LoadJobs`, where every call is a
-load job unless `FlushRows` says otherwise.
+`Sink` hands the rows it is given to the writer and waits for its `WriteResult`
+to settle, so nothing is buffered inside the `Sinker` itself: **the rows it is
+given are the batch handed to the writer.** What the writer then does with that
+batch is its own business — `LoadJobs.FlushRows` can hold rows back across
+calls, for instance (see [Flushing rows](#flushing-rows)). `Sink` returns how
+many of them that settlement counts as done, and a non-nil error whenever that
+is fewer than it was given: `rows[n:]` are exactly the ones that did not make
+it, and nothing else records them.
+
+What counts as done depends on the writer, not on `Sink`: delivery to BigQuery
+for one that promises it, or only acceptance into a buffer of its own for one
+that promises that instead, such as a `LoadJobsWriter` with `LoadJobs.FlushRows`
+set. **A `Sink` call whose rows only reached that buffer can still return `(n,
+nil)`** — the submission it goes on to trigger, or fails to, is reported later,
+by `FlushRows` or `Close`, not by this call (see [Flushing rows](#flushing-rows)).
+Give `Sink` a whole batch rather than one row at a time, especially with
+`LoadJobs`, where every call is a load job unless `FlushRows` says otherwise.
 
 A slice is a batch of its elements and anything else is a single row, so `Sink(ctx,
 rows)` and `Sink(ctx, row)` are both ordinary calls. Every row in a batch has to be of
@@ -82,16 +90,24 @@ Nothing contacts BigQuery until the first `Sink`, which is what reconciles the r
 table with the declaration and hands the writer the settled schema.
 
 `DeclarationOf[T]()` is the ordinary way to build a `Declaration`, for a row type
-known at compile time. Where the schema is only settled at run time — a
-`reflect.StructOf` type built from a schema fetched from somewhere else, say —
-`DeclarationForType(reflect.Type)` takes the type directly. Such a type only
-promotes the *value* receiver methods of what it embeds, so embedding
-`IngestionMetadata`, whose `FillRow` has a pointer receiver, leaves it uncalled;
-`NewSinker` rejects that rather than writing empty ingestion columns.
+known at compile time. Where the schema is only settled at run time,
+`DeclarationFromMetadata(md *bigquery.TableMetadata, marshalers ...*Marshalers)`
+reads it from data instead: the row type is fixed to `map[string]any`, since
+there is no Go type to derive columns from, and `md` supplies the schema a
+struct's tags would otherwise describe. `md` must not be nil and its `Schema`
+must not be empty, since there would then be nothing to check a row's keys
+against; either is reported here, the same as a struct tag `DeclarationOf`
+could not parse.
+
+A row built this way is a plain `map[string]any`: a key the schema does not
+declare is an error, and a column the map omits becomes NULL, the same as a
+struct field would. `RowFiller` has no way in — a map cannot implement it — so
+a caller wanting a column like `_ingestion_at` fills it into the map directly,
+before `Sink`.
 
 ## Options
 
-`NewSinker` takes three, and **none of them describes the table.** What the table
+`NewSinker` takes two, and **none of them describes the table.** What the table
 looks like belongs to the row type, which reaches `NewSinker` as a `Declaration`;
 these settle how bqsink behaves around that instead. How rows travel is settled
 earlier still, on the writer's own constructor — see [Transports](#transports).
@@ -99,8 +115,12 @@ earlier still, on the writer's own constructor — see [Transports](#transports)
 | Option | Default | Section |
 |---|---|---|
 | `WithMigrationStrategy` | `AppendNewColumns{CreateIfMissing: true}`, four retries | [Migration](#migration) |
-| `WithMarshalers` | no overrides | [Custom column types](#custom-column-types) |
 | `WithLogger` | records are discarded | [Logging](#logging) |
+
+Per-type marshaling overrides are not an Option either: `DeclarationOf` and
+`DeclarationFromMetadata` both take `marshalers ...*Marshalers` themselves, so
+that they settle how a value is written the same way they settle everything
+else about the table — see [Custom column types](#custom-column-types).
 
 A migration strategy is configured with a struct literal rather than an option of
 its own, so that its settings never look like one:
@@ -317,10 +337,11 @@ func (p Payload) MarshalBigQueryValue() (bigquery.Value, error) {
 }
 ```
 
-For types you do not own, register the mapping instead:
+For types you do not own, register the mapping instead, passed to `DeclarationOf`
+or `DeclarationFromMetadata` rather than to an Option:
 
 ```go
-bqsink.WithMarshalers(
+bqsink.DeclarationOf[Row](
 	bqsink.MarshalFunc(bigquery.StringFieldType, func(id ExternalID) (bigquery.Value, error) {
 		return id.String(), nil
 	}),
@@ -439,12 +460,26 @@ Neither talks to BigQuery yet: `NewWriter` only builds the writer, and what
 happens over the network happens on the first `Sink`, through the writer
 `NewSinker` was given.
 
-Every `WriteRows` returns a `WriteResult`, whose `Wait` reports how many of that
-call's rows landed. Using `Sink` hides this entirely: it calls `WriteRows` and
-blocks on `Wait` before returning, so "how many rows landed" is already the plain
-`(n, err)` `Sink` gives back, and there is nothing further to wait on. A
-`WriteResult` matters on its own only where something drives the writer directly —
-see [Flushing rows](#flushing-rows) below.
+Every `WriteRows` returns a `WriteResult`, whose `Wait` reports what that call's
+rows are settled as. That settlement is the writer's own promise, not the same
+for every one: delivery to BigQuery for a writer such as `StorageWrite`, or only
+acceptance into a buffer of its own for one such as a `LoadJobsWriter` with
+`LoadJobs.FlushRows` set. Using `Sink` hides most of this: it calls `WriteRows`
+and blocks on `Wait` before returning, so the `(n, err)` `Sink` gives back
+already is that settlement — but what it settles is still whichever promise the
+writer made, not necessarily delivery (see [Flushing rows](#flushing-rows)
+below).
+
+`SinkAsync` does the same batch reading, type checking, first-call
+reconciliation, per-row `FillRow` and conversion that `Sink` does, but hands
+back the `WriteResult` without calling `Wait` on it, leaving that to the
+caller. It suits a caller keeping several batches in flight at once, or one
+that wants to decide for itself when, or whether, to wait. `Sink`'s own guard
+against a writer under-reporting — returning an error when `Wait` reports
+fewer rows than were given — is not repeated here, since `SinkAsync` returns
+before there is anything to compare `Wait`'s answer against; a caller wanting
+the same guard compares the `n` its own call to `Wait` returns against how
+many rows it gave `SinkAsync`.
 
 **`StorageWrite`** uses the BigQuery Storage Write API. Each append is all or
 nothing: none of the rows in a rejected request land. Only the default and
@@ -480,15 +515,16 @@ load job once that many are held, instead of a job per call:
 w, err := (&bqsink.LoadJobs{FlushRows: 10_000}).NewWriter(client, relation)
 ```
 
-Waiting on a `WriteResult` is what submits the batch its rows are in, which is why
-`FlushRows` helps some callers and not others. Several goroutines calling `Sink` on
-the same writer at once share a job: the rows of every call that joins the open
-batch before one of them waits travel together, and each still gets back its own
-count when it waits. One goroutine calling `Sink` on its own, one batch after
-another, still gets a job per call, because `Sink` always waits before it returns
-and there is no one else's rows to gather in behind it — batching a caller like
-that is done the ordinary way, by giving `Sink` more rows per call, not by raising
-`FlushRows`.
+It is the threshold that submits a batch, not a `Wait` call: once a `WriteRows`
+appends enough rows to reach `FlushRows`, that call submits the batch itself,
+under `RetryPolicy`, and blocks until the job finishes before returning — the
+way `bufio.Writer` flushes on a full buffer rather than on `Flush`. Every
+earlier call that joined the same batch already returned, its rows merely
+accepted rather than delivered, so **a single goroutine calling `Sink` on its
+own, one batch after another, does end up with fewer jobs than calls once
+enough rows have gone by.** Several goroutines calling `Sink` on the same
+writer at once share a batch the same way and gain the same thing: whichever
+of them fills it is the one that submits, and the rest share its job.
 
 `FlushRows` earns its keep where rows are given to the writer directly through
 `WriteRows` — a lower-level entry point than `Sink`, taking already-marshalled
@@ -507,10 +543,14 @@ if err != nil {
 }
 
 // later, e.g. from a ticker, or once enough calls have gone by:
-if err := w.Flush(ctx); err != nil {
+res, err := w.FlushRows(ctx)
+if err != nil {
 	return err
 }
-if _, err := r1.Wait(ctx); err != nil { // already settled by Flush
+if _, err := res.Wait(ctx); err != nil { // the job's own outcome
+	return err
+}
+if _, err := r1.Wait(ctx); err != nil { // already settled by FlushRows
 	return err
 }
 if _, err := r2.Wait(ctx); err != nil {
@@ -518,14 +558,27 @@ if _, err := r2.Wait(ctx); err != nil {
 }
 ```
 
-`Close` submits whatever `FlushRows` is still holding back, so rows gathered but
-never flushed are not lost to a shutdown; it is also where a load job that failed
-with nobody ever waiting on it gets reported, since that would otherwise be rows
-lost with no one told.
+Discarding the `WriteResult` `FlushRows` returns without a `Wait` leaves no
+way to learn that job's own outcome, success or failure — `err` from
+`FlushRows` itself only reports whether the flush was accepted, not how the
+job it started turned out.
 
-**Buffering rows for longer does not by itself mean fewer jobs.** It only helps
-where several calls' rows actually share one open batch before being waited for,
-which is either concurrent `Sink` callers or a caller driving `WriteRows` itself.
+`Close` submits whatever `FlushRows` is still holding back, so rows gathered but
+never flushed are not lost to a shutdown; it is also where a threshold
+submission's failure gets reported if nothing has read it yet — that submission
+never had a `WriteResult` of its own to carry the outcome, so `Close` is the
+last chance.
+
+**Not calling `Close`, or ignoring the error it returns, can lose rows that a
+`Sink` or `WriteRows` call already reported as accepted.** A submission that
+one of those calls triggered on its own, by filling the buffer to `FlushRows`,
+is folded into the error `Close` returns if nothing else reported it first —
+skip `Close` and that outcome reaches no one.
+
+**A `FlushRows` call's own submission is different: its outcome is carried
+solely by the `WriteResult` that call returned.** Discard that result without a
+`Wait` and `Close` does not recover it either — the rows behind it are lost to
+every caller, not just the one that called `FlushRows`.
 
 ## Retries
 

@@ -1004,25 +1004,20 @@ func TestIntegrationTaggedLayout(t *testing.T) {
 }
 
 // flushRowsIntegrationRow is written one row at a time to check that
-// LoadJobs.FlushRows still delivers every row, including the ones Flush and
-// Close send on the writer's own initiative.
+// LoadJobs.FlushRows gathers rows across Sink calls.
 type flushRowsIntegrationRow struct {
 	ID  string `bqsink:"id,required"`
 	Seq int64  `bqsink:"seq"`
 }
 
-// TestIntegrationLoadJobsFlushRows checks that FlushRows does not drop a row.
+// TestIntegrationLoadJobsFlushRows checks that FlushRows does not drop a row,
+// covering both ways a held row reaches BigQuery: the buffer reaching the
+// threshold on its own, mid-way through the Sink calls below, and an explicit
+// FlushRows for what the buffer still holds afterwards.
 //
-// Sink itself waits on its WriteResult synchronously, so a single goroutine
-// calling it one row at a time submits each row's own batch before another
-// can join it: FlushRows never gathers anything across Sink calls. To
-// actually hold rows under the threshold, and so exercise Flush and Close
-// sending what was held, this test writes the buffered rows through the
-// writer directly and does not wait on their WriteResult, which is what a
-// caller gathering rows itself would do.
-//
-// It does not check how many load jobs ran: that would be a claim about job
-// counts this setup cannot make honestly.
+// WriteRows now reports acceptance into the buffer rather than delivery, so
+// Sink's wait on that settles at once and does not force a submission; that is
+// what lets the buffer gather rows across ordinary, sequential Sink calls.
 func TestIntegrationLoadJobsFlushRows(t *testing.T) {
 	t.Parallel()
 
@@ -1044,38 +1039,179 @@ func TestIntegrationLoadJobsFlushRows(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if _, err := s.Sink(ctx, flushRowsIntegrationRow{ID: "flush-0", Seq: 0}); err != nil {
-		t.Fatalf("Sink() error = %v", err)
-	}
-
-	for _, seq := range []int64{1, 2} {
-		row, err := s.prepare(ctx, reflect.ValueOf(flushRowsIntegrationRow{ID: fmt.Sprintf("flush-%d", seq), Seq: seq}))
-		if err != nil {
-			t.Fatalf("prepare() row %d error = %v", seq, err)
-		}
-		if _, err := w.WriteRows(ctx, []Row{row}); err != nil {
-			t.Fatalf("WriteRows() row %d error = %v", seq, err)
+	for _, seq := range []int64{0, 1, 2, 3} {
+		row := flushRowsIntegrationRow{ID: fmt.Sprintf("flush-%d", seq), Seq: seq}
+		if _, err := s.Sink(ctx, row); err != nil {
+			t.Fatalf("Sink() row %d error = %v", seq, err)
 		}
 	}
-	if err := w.Flush(ctx); err != nil {
-		t.Fatalf("Flush() error = %v", err)
-	}
-	if rows := readRows(t, client, relation, 3); len(rows) != 3 {
-		t.Fatalf("read %d row(s) after Flush(), want 3; Flush must send what FlushRows was holding", len(rows))
-	}
 
-	row, err := s.prepare(ctx, reflect.ValueOf(flushRowsIntegrationRow{ID: "flush-3", Seq: 3}))
+	result, err := w.FlushRows(ctx)
 	if err != nil {
-		t.Fatalf("prepare() error = %v", err)
+		t.Fatalf("FlushRows() error = %v", err)
 	}
-	if _, err := w.WriteRows(ctx, []Row{row}); err != nil {
-		t.Fatalf("WriteRows() error = %v", err)
-	}
-	if err := w.Close(ctx); err != nil {
-		t.Fatalf("Close() error = %v", err)
+	if n, err := result.Wait(ctx); err != nil || n != 1 {
+		t.Fatalf("FlushRows() delivered %d row(s), err = %v, want 1 row and no error", n, err)
 	}
 
 	if rows := readRows(t, client, relation, 4); len(rows) != 4 {
-		t.Fatalf("read %d row(s) after Close(), want 4; Close must send what FlushRows was holding", len(rows))
+		t.Fatalf("read %d row(s), want 4; the threshold submission and FlushRows must together deliver every row", len(rows))
 	}
+
+	if err := w.Close(ctx); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+// mapIntegrationSchema declares a scalar, a REPEATED and a RECORD column, so a
+// map[string]any row exercises the branches a struct row cannot reach without
+// a "record" tag.
+func mapIntegrationSchema() bigquery.Schema {
+	return bigquery.Schema{
+		{Name: "id", Type: bigquery.StringFieldType, Required: true},
+		{Name: "count", Type: bigquery.IntegerFieldType},
+		{Name: "tags", Type: bigquery.StringFieldType, Repeated: true},
+		{Name: "inner", Type: bigquery.RecordFieldType, Schema: bigquery.Schema{
+			{Name: "a", Type: bigquery.StringFieldType},
+			{Name: "b", Type: bigquery.IntegerFieldType},
+		}},
+	}
+}
+
+func sampleMapIntegrationRow(id string) map[string]any {
+	return map[string]any{
+		"id":    id,
+		"count": int64(42),
+		"tags":  []any{"a", "b"},
+		"inner": map[string]any{"a": "inner-a", "b": int64(7)},
+	}
+}
+
+// checkMapIntegrationRow verifies the values BigQuery returns for a row
+// written by sampleMapIntegrationRow.
+func checkMapIntegrationRow(t *testing.T, row map[string]bigquery.Value, id string) {
+	t.Helper()
+	if got := row["id"]; got != id {
+		t.Errorf("id = %#v, want %q", got, id)
+	}
+	if got := row["count"]; got != int64(42) {
+		t.Errorf("count = %#v, want 42", got)
+	}
+	tags, ok := row["tags"].([]bigquery.Value)
+	if !ok || len(tags) != 2 || tags[0] != "a" || tags[1] != "b" {
+		t.Errorf("tags = %#v, want [a b]", row["tags"])
+	}
+	inner, ok := row["inner"].(map[string]bigquery.Value)
+	if !ok {
+		t.Errorf("inner = %#v, want a nested map", row["inner"])
+	} else {
+		if inner["a"] != "inner-a" {
+			t.Errorf("inner.a = %#v, want inner-a", inner["a"])
+		}
+		if inner["b"] != int64(7) {
+			t.Errorf("inner.b = %#v, want 7", inner["b"])
+		}
+	}
+}
+
+// findRowByID returns the row whose id column equals id, failing the test when
+// none matches. It exists because readRows can return rows from more than one
+// Sink call sharing the same table.
+func findRowByID(t *testing.T, rows []map[string]bigquery.Value, id string) map[string]bigquery.Value {
+	t.Helper()
+	for _, row := range rows {
+		if row["id"] == id {
+			return row
+		}
+	}
+	t.Fatalf("no row with id %q among %d row(s)", id, len(rows))
+	return nil
+}
+
+// TestIntegrationMapRowFromFetchedMetadata checks DeclarationFromMetadata
+// against a real table in the shape its GoDoc calls out as the natural one: a
+// *bigquery.TableMetadata read back with table.Metadata(ctx), handed to
+// DeclarationFromMetadata unchanged rather than one built by hand.
+//
+// The metadata fetched for the first table (relationA) carries that table's
+// own read-only fields — ETag, NumRows, CreationTime, LastModifiedTime,
+// FullID — since that is what a real Metadata call returns. The second phase
+// reuses that same value, unchanged, to create a second, different table
+// (relationB) through AppendNewColumns{CreateIfMissing: true}; newTableMetadata
+// copies it into the Create call as is, so this is where it would show if
+// tables.insert rejected those fields rather than ignoring them. If Sink fails
+// there, that is the finding to report, not something to fix here.
+func TestIntegrationMapRowFromFetchedMetadata(t *testing.T) {
+	t.Parallel()
+
+	projectID, datasetID := integrationTarget(t)
+	client := integrationClient(t, projectID)
+	ensureDataset(t, client, datasetID)
+	relationA := integrationRelation(t, client, projectID, datasetID)
+
+	ctx := context.Background()
+	seedWriter, err := (&LoadJobs{}).NewWriter(client, relationA)
+	if err != nil {
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	closeWriter(t, seedWriter)
+	seed, err := NewSinker(seedWriter, DeclarationFromMetadata(&bigquery.TableMetadata{Schema: mapIntegrationSchema()}),
+		WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
+	)
+	if err != nil {
+		t.Fatalf("NewSinker() for the seed table error = %v", err)
+	}
+	if _, err := seed.Sink(ctx, sampleMapIntegrationRow("seed")); err != nil {
+		t.Fatalf("Sink() error = %v", err)
+	}
+
+	fetched, err := relationA.table(client).Metadata(ctx)
+	if err != nil {
+		t.Fatalf("Metadata() error = %v", err)
+	}
+
+	t.Run("writing through the table's own fetched metadata round-trips", func(t *testing.T) {
+		w, err := (&LoadJobs{}).NewWriter(client, relationA)
+		if err != nil {
+			t.Fatalf("NewWriter() error = %v", err)
+		}
+		closeWriter(t, w)
+		s, err := NewSinker(w, DeclarationFromMetadata(fetched))
+		if err != nil {
+			t.Fatalf("NewSinker() error = %v", err)
+		}
+		if _, err := s.Sink(ctx, sampleMapIntegrationRow("fetched")); err != nil {
+			t.Fatalf("Sink() error = %v", err)
+		}
+
+		rows := readRows(t, client, relationA, 2)
+		if len(rows) < 2 {
+			t.Fatalf("read %d row(s), want at least 2", len(rows))
+		}
+		checkMapIntegrationRow(t, findRowByID(t, rows, "fetched"), "fetched")
+	})
+
+	t.Run("CreateIfMissing on another table from the same fetched metadata", func(t *testing.T) {
+		relationB := integrationRelation(t, client, projectID, datasetID)
+		w, err := (&LoadJobs{}).NewWriter(client, relationB)
+		if err != nil {
+			t.Fatalf("NewWriter() error = %v", err)
+		}
+		closeWriter(t, w)
+		s, err := NewSinker(w, DeclarationFromMetadata(fetched),
+			WithMigrationStrategy(AppendNewColumns{CreateIfMissing: true}, nil),
+		)
+		if err != nil {
+			t.Fatalf("NewSinker() error = %v", err)
+		}
+		if _, err := s.Sink(ctx, sampleMapIntegrationRow("created")); err != nil {
+			t.Fatalf("Sink() error = %v; table creation from another table's fetched metadata was rejected", err)
+		}
+
+		rows := readRows(t, client, relationB, 1)
+		if len(rows) != 1 {
+			t.Fatalf("read %d row(s), want 1", len(rows))
+		}
+		checkMapIntegrationRow(t, rows[0], "created")
+	})
 }

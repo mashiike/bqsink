@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,13 @@ var (
 	// strategy did not ask for it to be created. Set CreateIfMissing on the
 	// strategy to create it.
 	ErrTableMissing = errors.New("bqsink: table does not exist")
+
+	// ErrWriterClosed reports that a writer's Close was already called,
+	// distinguishing that from any other reason a call might fail so that a
+	// caller racing a graceful shutdown against an in-flight write can tell
+	// the two apart. It is always wrapped with which writer and method
+	// refused the call, never returned bare.
+	ErrWriterClosed = errors.New("the writer is closed")
 )
 
 // TableDefiner lets a row type declare table level settings such as
@@ -76,44 +84,119 @@ func (r clientQueryRunner) run(ctx context.Context, sql string) error {
 
 // Declaration says what the destination table should hold.
 //
-// It is read off a row type: the struct tags describe the columns, and a
-// BigQueryTableMetadata method describes what tags cannot. Handing one to NewSinker
-// settles the table's shape for good, which is why everything the declaration
-// decides is reported there — a tag that cannot be parsed, a column its spelled out
-// schema has no room for, a FillRow with a value receiver — rather than by the first
-// row written.
+// It is evaluated once, when it is built with DeclarationOf: the struct tags
+// describe the columns, and a BigQueryTableMetadata method describes what tags
+// cannot. Evaluating it there settles the table's shape for good, which is why
+// everything the declaration decides is reported there — a tag that cannot be
+// parsed, a column its spelled out schema has no room for, a FillRow with a value
+// receiver — rather than by NewSinker or the first row written.
 //
 // A constructor here reports nothing itself, so that it composes into the NewSinker
-// call; what it could not make sense of comes back from NewSinker.
+// call; what it could not make sense of is carried on the Declaration and comes
+// back from NewSinker.
+//
+// fills is also settled here: whether the row type fills its own columns, so that
+// a Sinker built from the Declaration knows it without asking on every row.
 type Declaration struct {
 	rowType  reflect.Type
+	plan     rowConverter
+	schema   bigquery.Schema
 	metadata *bigquery.TableMetadata
+	fills    bool
 	err      error
 }
 
-// DeclarationOf returns what T declares about its table.
-//
-// This is the ordinary way to declare one. The row type carries the domain
-// knowledge that gives its columns meaning, so it is the one place that can say
-// what the table holds.
-func DeclarationOf[T any]() Declaration {
-	return DeclarationForType(reflect.TypeFor[T]())
+// rowConverter is what a Sinker needs from the plan a Declaration carries: a
+// way to turn one row into the columns to write. rowPlan derives that from a
+// Go struct's fields, and mapPlan derives it from a declared schema instead,
+// but Sink never needs to tell which one it is holding.
+type rowConverter interface {
+	marshalRow(rv reflect.Value) (map[string]bigquery.Value, error)
 }
 
-// DeclarationForType returns what rt declares about its table, for a row type only
-// settled at run time, such as one reflect.StructOf built from a schema fetched
-// from somewhere else.
+// DeclarationOf returns what T declares about its table, evaluated immediately.
 //
-// A type built that way carries no methods of its own, so its table's settings come
-// from its tags alone. It does promote the value receiver methods of what it embeds,
-// which is enough for TableDefiner; a pointer receiver's are not promoted, so
-// embedding IngestionMetadata in one would leave FillRow uncalled, and NewSinker
-// turns that down rather than writing empty columns.
-func DeclarationForType(rt reflect.Type) Declaration {
-	if rt == nil {
-		return Declaration{err: errors.New("bqsink: DeclarationForType: the type is nil")}
+// The row type carries the domain knowledge that gives its columns meaning, so it
+// is the one place that can say what the table holds.
+//
+// marshalers registers per-type overrides of how a Go type becomes a BigQuery
+// column, built with MarshalFunc. They apply both to the schema derived from the
+// row type's struct tags and to the values written, and they win over a type's own
+// FieldMarshaler. Where a TableDefiner supplies the schema outright the overrides
+// do not reach it, since nothing is derived in that case, and they still decide how
+// the values are written. Passing more than one keeps the mapping registered last;
+// passing none leaves every type to its own FieldMarshaler or bqsink's own rules,
+// which is what every call before marshalers existed did.
+func DeclarationOf[T any](marshalers ...*Marshalers) Declaration {
+	return declarationOf(reflect.TypeFor[T](), joinMarshalers(marshalers))
+}
+
+// declarationOf evaluates what rt declares about its table: the plan mapping its
+// columns, the schema and table metadata that follow from it, and whether it fills
+// its own rows.
+func declarationOf(rt reflect.Type, marshalers *Marshalers) Declaration {
+	plan, err := buildRowPlan(rt, marshalers)
+	if err != nil {
+		return Declaration{err: err}
 	}
-	return Declaration{rowType: rt, metadata: tableMetadataOf(rt)}
+	rawMetadata := tableMetadataOf(rt)
+	schema, err := resolveSchema(rawMetadata, plan)
+	if err != nil {
+		return Declaration{err: err}
+	}
+	metadata, err := resolveTableMetadata(rawMetadata, plan)
+	if err != nil {
+		return Declaration{err: err}
+	}
+	fills, err := checkRowFiller(rt)
+	if err != nil {
+		return Declaration{err: err}
+	}
+	return Declaration{rowType: rt, plan: plan, schema: schema, metadata: metadata, fills: fills}
+}
+
+// DeclarationFromMetadata returns what md declares about its table, for a row
+// written as a map[string]any rather than a Go struct: the schema is settled
+// at run time, in md, rather than by any type's tags.
+//
+// The row type is fixed to map[string]any; there is no type parameter to name
+// a different one. marshalers are the same per-type overrides DeclarationOf
+// takes, looked up by each value's own dynamic type since a map has no fields
+// of its own to carry them.
+//
+// md must not be nil and md.Schema must not be empty, since there would then
+// be nothing to check a row's keys against or convert its values into; either
+// is reported as an error carried on the Declaration, the same as a struct
+// tag DeclarationOf could not parse.
+//
+// RowFiller has no effect on a row built this way: a map cannot implement it,
+// so a caller wanting an ingestion column of its own kind fills it into the
+// map directly, before Sink.
+//
+// md is not retained by reference for its top-level fields, which are copied
+// once here, but its Schema's *bigquery.FieldSchema elements are not deep
+// copied. Mutating one of those after this call is a precondition violation
+// this does not defend against beyond never panicking on it.
+func DeclarationFromMetadata(md *bigquery.TableMetadata, marshalers ...*Marshalers) Declaration {
+	if md == nil {
+		return Declaration{err: errors.New("bqsink: DeclarationFromMetadata: table metadata is nil")}
+	}
+	if len(md.Schema) == 0 {
+		return Declaration{err: errors.New("bqsink: DeclarationFromMetadata: table metadata has no schema")}
+	}
+	schema := slices.Clone(md.Schema)
+	plan, err := buildMapPlan(schema, joinMarshalers(marshalers))
+	if err != nil {
+		return Declaration{err: err}
+	}
+	copied := *md
+	copied.Schema = schema
+	return Declaration{
+		rowType:  reflect.TypeFor[map[string]any](),
+		plan:     plan,
+		schema:   schema,
+		metadata: &copied,
+	}
 }
 
 // Sinker writes rows of one declared type to one BigQuery table.
@@ -134,9 +217,10 @@ type Sinker struct {
 	logger         *slog.Logger
 
 	rowType  reflect.Type
-	plan     *rowPlan
+	plan     rowConverter
 	schema   bigquery.Schema
 	metadata *bigquery.TableMetadata
+	fills    bool
 
 	sinkerID  string
 	createdAt time.Time
@@ -148,11 +232,11 @@ type Sinker struct {
 
 // NewSinker returns a Sinker writing what decl declares through w.
 //
-// The declaration is read here, so a row type that cannot be mapped to a row, a
-// column its spelled out schema has no room for, or a FillRow with a value receiver
-// all fail now rather than on the first write. Nothing contacts BigQuery: the real
-// table is read once the first batch arrives, since a Sinker with no rows to write
-// has nothing to reconcile.
+// decl is evaluated once, when it is built with DeclarationOf, so what NewSinker
+// checks about it is only that it built cleanly: decl.err, if DeclarationOf could
+// not make sense of the row type, comes back here rather than on the first write.
+// Nothing contacts BigQuery either: the real table is read once the first batch
+// arrives, since a Sinker with no rows to write has nothing to reconcile.
 //
 // Without options the migration strategy is AppendNewColumns{CreateIfMissing:
 // true}, which creates the table if it is absent and adds the columns the
@@ -174,7 +258,7 @@ func NewSinker(w RowsWriter, decl Declaration, opts ...Option) (*Sinker, error) 
 		return nil, decl.err
 	}
 	if decl.rowType == nil {
-		return nil, errors.New("bqsink: NewSinker: the declaration says nothing; build it with DeclarationOf or DeclarationForType")
+		return nil, errors.New("bqsink: NewSinker: the declaration says nothing; build it with DeclarationOf")
 	}
 	relation := w.Relation()
 	if err := relation.validate(); err != nil {
@@ -201,10 +285,6 @@ func NewSinker(w RowsWriter, decl Declaration, opts ...Option) (*Sinker, error) 
 	}
 	logger = logger.With(slog.String("relation", relation.String()))
 
-	plan, schema, metadata, err := resolveDeclaration(decl, c.marshalers)
-	if err != nil {
-		return nil, err
-	}
 	sinkerID, err := newID()
 	if err != nil {
 		return nil, fmt.Errorf("bqsink: %w", err)
@@ -216,9 +296,10 @@ func NewSinker(w RowsWriter, decl Declaration, opts ...Option) (*Sinker, error) 
 		migrationRetry: migrationRetry,
 		logger:         logger,
 		rowType:        decl.rowType,
-		plan:           plan,
-		schema:         schema,
-		metadata:       metadata,
+		plan:           decl.plan,
+		schema:         decl.schema,
+		metadata:       decl.metadata,
+		fills:          decl.fills,
 		sinkerID:       sinkerID,
 		createdAt:      time.Now(),
 		now:            time.Now,
@@ -259,27 +340,6 @@ func checkStrategyWithoutAClient(w RowsWriter, relation Relation, strategy Migra
 			w, relation)
 	}
 	return nil
-}
-
-// resolveDeclaration works out what to write, what the table should look like, and
-// what settings it should have, from what the row type declares.
-func resolveDeclaration(decl Declaration, marshalers *Marshalers) (*rowPlan, bigquery.Schema, *bigquery.TableMetadata, error) {
-	plan, err := buildRowPlan(decl.rowType, marshalers)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	schema, err := resolveSchema(decl.metadata, plan)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	metadata, err := resolveTableMetadata(decl.metadata, plan)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	if err := checkRowFiller(decl.rowType); err != nil {
-		return nil, nil, nil, err
-	}
-	return plan, schema, metadata, nil
 }
 
 // resolveSchema settles the declared schema: the one the row type's
@@ -391,12 +451,6 @@ func tableMetadataOf(rt reflect.Type) *bigquery.TableMetadata {
 	return nil
 }
 
-// Relation returns the relation naming the destination table, which is the one the
-// writer reports.
-func (s *Sinker) Relation() Relation {
-	return s.relation
-}
-
 // start brings the real table in line with the declaration and hands the writer the
 // schema, on the way to writing the first batch.
 //
@@ -422,7 +476,13 @@ func (s *Sinker) start(ctx context.Context) error {
 	return s.startErr
 }
 
-// Sink writes rows and returns how many of them reached BigQuery.
+// Sink writes rows and waits for the writer's WriteResult to settle, returning
+// how many of them that settlement counts as done. What counts as done is the
+// writer's own promise, documented on WriteResult: how many reached BigQuery
+// for a writer promising delivery, and only how many reached its own buffer
+// for one promising acceptance instead, such as a LoadJobsWriter with
+// LoadJobs.FlushRows set — what becomes of those once a job carries them is
+// for FlushRows or Close to report, not Sink.
 //
 // A slice is a batch of its elements and anything else is a single row, so a
 // []AccessLog and one AccessLog go through the same call. An empty or nil slice
@@ -440,10 +500,11 @@ func (s *Sinker) start(ctx context.Context) error {
 // though the writer may hold rows back when it was asked to.
 //
 // Sink returns a non-nil error whenever n is fewer than the rows it was given, so
-// that rows[n:] are exactly the ones that did not land. The caller still holds them,
-// which is what makes dealing with them the caller's choice; nothing else records
-// what was lost. n counts rows written and not rows prepared: a row that cannot be
-// converted leaves n at 0 even though the rows before it were converted.
+// that rows[n:] are exactly the ones the writer did not settle as done. The caller
+// still holds them, which is what makes dealing with them the caller's choice;
+// nothing else records what was lost. n counts rows the writer settled and not rows
+// prepared: a row that cannot be converted leaves n at 0 even though the rows before
+// it were converted.
 //
 // If the row type implements RowFiller, FillRow is called on a copy of each element
 // first, so that the row can fill in columns such as a write timestamp. That happens
@@ -454,47 +515,87 @@ func (s *Sinker) start(ctx context.Context) error {
 // at-least-once; IngestionMetadata's _ingestion_row_id is what makes those
 // duplicates identifiable.
 func (s *Sinker) Sink(ctx context.Context, rows any) (int, error) {
-	vs, err := rowsOf(rows)
+	result, sent, err := s.send(ctx, rows)
 	if err != nil {
 		return 0, err
 	}
+	n, err := result.Wait(ctx)
+	if err == nil && n != sent {
+		// A writer that reports fewer rows than it was given owes an error saying so,
+		// the way bufio turns the same silence into io.ErrShortWrite. Letting it pass
+		// would be a row lost without a word, which is what bqsink exists to prevent.
+		return n, fmt.Errorf("bqsink: %T wrote %d of %d row(s) but reported no error", s.writer, n, sent)
+	}
+	return n, err
+}
+
+// SinkAsync writes rows the way Sink does — the same batch reading, type check,
+// first-call reconciliation, per-row FillRow and conversion — but hands the
+// writer's WriteResult back without calling Wait on it, so the caller decides
+// when, or whether, to. That does not make the call itself prompt: a writer may
+// still do the work, and block for it, inside WriteRows rather than behind Wait.
+//
+// Whether the returned WriteResult is already resolved and what it promises are
+// the writer's own business, documented on WriteResult: delivery for one writer,
+// only acceptance into a buffer for another. SinkAsync itself promises no more
+// than having handed the rows to the writer; a non-nil error here means they
+// were not even that, and the returned WriteResult is nil. On a nil error the
+// WriteResult is never nil.
+//
+// Sink's own guard against a writer under-reporting is Sink's alone: SinkAsync
+// does not know how many rows a caller is about to hand the returned
+// WriteResult's Wait to compare against. A caller that wants the same guard
+// gets it by comparing the n Wait returns against how many rows it gave
+// SinkAsync itself.
+func (s *Sinker) SinkAsync(ctx context.Context, rows any) (WriteResult, error) {
+	result, _, err := s.send(ctx, rows)
+	return result, err
+}
+
+// send reads the batch, checks its row type against the declaration, reconciles
+// the table on the first call, lets each row fill itself in and converts it, and
+// hands the batch to the writer. It is what Sink and SinkAsync share, so that the
+// only difference between them is whether the returned WriteResult is waited on.
+//
+// sent is the number of rows handed to the writer, which is what the returned
+// WriteResult's Wait is expected to account for. On a nil error the result is
+// never nil: an empty batch short-circuits with a result already resolved at
+// n=0, sent=0, before the table is ever reconciled.
+func (s *Sinker) send(ctx context.Context, rows any) (WriteResult, int, error) {
+	vs, err := rowsOf(rows)
+	if err != nil {
+		return nil, 0, err
+	}
 	if len(vs) == 0 {
-		return 0, nil
+		return ResolvedResult(0, nil), 0, nil
 	}
 	rt, err := batchRowType(vs)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	if rt != s.rowType {
-		return 0, fmt.Errorf("bqsink: this Sinker writes %s, which its declaration settled; %s has to go to a Sinker of its own",
+		return nil, 0, fmt.Errorf("bqsink: this Sinker writes %s, which its declaration settled; %s has to go to a Sinker of its own",
 			s.rowType, rt)
 	}
 	if err := s.start(ctx); err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	out := make([]Row, len(vs))
 	for i, v := range vs {
 		row, err := s.prepare(ctx, v)
 		if err != nil {
-			return 0, err
+			return nil, 0, err
 		}
 		out[i] = row
 	}
 	result, err := s.writer.WriteRows(ctx, out)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	if result == nil {
-		return 0, fmt.Errorf("bqsink: %T took %d row(s) and returned neither a result nor an error", s.writer, len(out))
+		return nil, 0, fmt.Errorf("bqsink: %T took %d row(s) and returned neither a result nor an error", s.writer, len(out))
 	}
-	n, err := result.Wait(ctx)
-	if err == nil && n != len(out) {
-		// A writer that reports fewer rows than it was given owes an error saying so,
-		// the way bufio turns the same silence into io.ErrShortWrite. Letting it pass
-		// would be a row lost without a word, which is what bqsink exists to prevent.
-		return n, fmt.Errorf("bqsink: %T wrote %d of %d row(s) but reported no error", s.writer, n, len(out))
-	}
-	return n, err
+	return result, len(out), nil
 }
 
 // rowsOf reads the rows out of what Sink was handed. A slice or an array is a batch
@@ -549,11 +650,20 @@ func (s *Sinker) prepare(ctx context.Context, v reflect.Value) (Row, error) {
 	if err != nil {
 		return Row{}, fmt.Errorf("bqsink: %w", err)
 	}
-	rv, err := fillable(v)
-	if err != nil {
-		return Row{}, err
-	}
-	if filler, ok := rv.Interface().(RowFiller); ok {
+	rv := v
+	if !s.fills {
+		if v.Kind() == reflect.Pointer && v.IsNil() {
+			return Row{}, fmt.Errorf("bqsink: cannot write a nil %s", v.Type())
+		}
+	} else {
+		rv, err = fillable(v)
+		if err != nil {
+			return Row{}, err
+		}
+		filler, ok := rv.Interface().(RowFiller)
+		if !ok {
+			return Row{}, fmt.Errorf("bqsink: %s no longer implements RowFiller", v.Type())
+		}
 		info := AppendInfo{
 			Relation:        s.relation,
 			SinkerID:        s.sinkerID,
