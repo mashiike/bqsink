@@ -1,0 +1,46 @@
+name: reviewdog
+on: [pull_request]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  golangci-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: golangci-lint
+        uses: reviewdog/action-golangci-lint@555d223c084e4a9e482ed7bd2de3785928a03369 # v2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          level: warning
+          golangci_lint_flags: "--config=.golangci.yaml"
+          filter_mode: diff_context
+          reporter: github-pr-review
+          fail_level: error
+
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: reviewdog/action-actionlint@60f9666828d33cc321ea5a5c02042d940f790682 # v1
+        with:
+          reporter: github-pr-review
+          filter_mode: diff_context
+          fail_level: error
+
+  misspell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: reviewdog/action-misspell@0789410278cba39afd488d97a0e305ba35776bbf # v1
+        with:
+          reporter: github-pr-review
+          level: warning
+          filter_mode: diff_context
+          fail_level: error
+          exclude: |
+            ./.git/*
+            ./CHANGELOG.md

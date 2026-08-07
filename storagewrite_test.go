@@ -1,0 +1,365 @@
+package bqsink
+
+import (
+	"math/big"
+	"strings"
+	"testing"
+	"time"
+
+	"cloud.google.com/go/bigquery"
+	"cloud.google.com/go/bigquery/storage/managedwriter"
+	"cloud.google.com/go/bigquery/storage/managedwriter/adapt"
+	"cloud.google.com/go/civil"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/dynamicpb"
+)
+
+func storageWriteSchema() bigquery.Schema {
+	return bigquery.Schema{
+		{Name: "user_id", Type: bigquery.StringFieldType},
+		{Name: "req", Type: bigquery.StringFieldType, Required: true},
+		{Name: "count", Type: bigquery.IntegerFieldType},
+		{Name: "rate", Type: bigquery.FloatFieldType},
+		{Name: "flag", Type: bigquery.BooleanFieldType},
+		{Name: "blob", Type: bigquery.BytesFieldType},
+		{Name: "at", Type: bigquery.TimestampFieldType},
+		{Name: "day", Type: bigquery.DateFieldType},
+		{Name: "clock", Type: bigquery.TimeFieldType},
+		{Name: "moment", Type: bigquery.DateTimeFieldType},
+		{Name: "money", Type: bigquery.NumericFieldType},
+		{Name: "huge", Type: bigquery.BigNumericFieldType},
+		{Name: "doc", Type: bigquery.JSONFieldType},
+		{Name: "tags", Type: bigquery.StringFieldType, Repeated: true},
+		{Name: "inner", Type: bigquery.RecordFieldType, Schema: abSchema()},
+	}
+}
+
+// TestRowDescriptorMapsTextualTypesToString checks the overrides that let one row
+// rendering serve both transports. Without them NUMERIC and BIGNUMERIC would be
+// bytes holding a BigDecimal, and DATETIME and TIME would be int64 in an encoding
+// the client library does not expose.
+func TestRowDescriptorMapsTextualTypesToString(t *testing.T) {
+	t.Parallel()
+
+	md, err := rowDescriptor(storageWriteSchema())
+	if err != nil {
+		t.Fatalf("rowDescriptor() error = %v", err)
+	}
+
+	want := map[string]protoreflect.Kind{
+		"user_id": protoreflect.StringKind,
+		"req":     protoreflect.StringKind,
+		"count":   protoreflect.Int64Kind,
+		"rate":    protoreflect.DoubleKind,
+		"flag":    protoreflect.BoolKind,
+		"blob":    protoreflect.BytesKind,
+		"at":      protoreflect.Int64Kind,
+		"day":     protoreflect.StringKind,
+		"clock":   protoreflect.StringKind,
+		"moment":  protoreflect.StringKind,
+		"money":   protoreflect.StringKind,
+		"huge":    protoreflect.StringKind,
+		"doc":     protoreflect.StringKind,
+		"tags":    protoreflect.StringKind,
+		"inner":   protoreflect.MessageKind,
+	}
+	fields := md.Fields()
+	if fields.Len() != len(want) {
+		t.Fatalf("the descriptor has %d fields, want %d", fields.Len(), len(want))
+	}
+	for i := range fields.Len() {
+		f := fields.Get(i)
+		name := string(f.Name())
+		expected, ok := want[name]
+		if !ok {
+			t.Errorf("unexpected proto field %q", name)
+			continue
+		}
+		if f.Kind() != expected {
+			t.Errorf("field %s kind = %s, want %s", name, f.Kind(), expected)
+		}
+	}
+}
+
+func TestRowDescriptorKeepsColumnNames(t *testing.T) {
+	t.Parallel()
+
+	md, err := rowDescriptor(storageWriteSchema())
+	if err != nil {
+		t.Fatalf("rowDescriptor() error = %v", err)
+	}
+	if f := md.Fields().ByName("user_id"); f == nil {
+		t.Error("the descriptor has no field named user_id; the JSON keys would not match")
+	}
+}
+
+// TestStorageWriteRowFitsTheDescriptor is the end-to-end check on the client side:
+// the JSON bqsink renders has to be exactly what protojson can feed into the
+// descriptor derived from the same schema.
+func TestStorageWriteRowFitsTheDescriptor(t *testing.T) {
+	t.Parallel()
+
+	schema := storageWriteSchema()
+	md, err := rowDescriptor(schema)
+	if err != nil {
+		t.Fatalf("rowDescriptor() error = %v", err)
+	}
+
+	at := time.Date(2026, 7, 28, 12, 30, 0, 0, time.UTC)
+	row := map[string]bigquery.Value{
+		"user_id": "u1",
+		"req":     "needed",
+		"count":   int64(42),
+		"rate":    1.5,
+		"flag":    true,
+		"blob":    []byte("bytes"),
+		"at":      at,
+		"day":     civil.DateOf(at),
+		"clock":   civil.TimeOf(at),
+		"moment":  civil.DateTimeOf(at),
+		"money":   big.NewRat(25, 2),
+		"huge":    new(big.Rat).SetUint64(18446744073709551615),
+		"doc":     `{"k":"v"}`,
+		"tags":    []bigquery.Value{"a", "b"},
+		"inner":   map[string]bigquery.Value{"A": "a", "B": int64(1)},
+	}
+
+	text, err := encodeStorageWriteRow(row, schema)
+	if err != nil {
+		t.Fatalf("encodeStorageWriteRow() error = %v", err)
+	}
+	message := dynamicpb.NewMessage(md)
+	if err := protojson.Unmarshal(text, message); err != nil {
+		t.Fatalf("protojson.Unmarshal(%s) error = %v", text, err)
+	}
+	data, err := proto.Marshal(message)
+	if err != nil {
+		t.Fatalf("proto.Marshal() error = %v", err)
+	}
+	if len(data) == 0 {
+		t.Error("the marshalled row is empty")
+	}
+}
+
+func TestStorageWriteRendersTimestampAsMicroseconds(t *testing.T) {
+	t.Parallel()
+
+	at := time.Date(2026, 7, 28, 12, 30, 0, 0, time.UTC)
+	schema := bigquery.Schema{{Name: "at", Type: bigquery.TimestampFieldType}}
+
+	storage, err := encodeStorageWriteRow(map[string]bigquery.Value{"at": at}, schema)
+	if err != nil {
+		t.Fatalf("encodeStorageWriteRow() error = %v", err)
+	}
+	if want := `{"at":1785241800000000}`; string(storage) != want {
+		t.Errorf("Storage Write rendering = %s, want %s", storage, want)
+	}
+
+	load, err := encodeJSONRow(map[string]bigquery.Value{"at": at}, schema)
+	if err != nil {
+		t.Fatalf("encodeJSONRow() error = %v", err)
+	}
+	if want := `{"at":"2026-07-28T12:30:00Z"}`; string(load) != want {
+		t.Errorf("load job rendering = %s, want %s", load, want)
+	}
+}
+
+func TestRequiredColumnRejectsNull(t *testing.T) {
+	t.Parallel()
+
+	schema := bigquery.Schema{{Name: "req", Type: bigquery.StringFieldType, Required: true}}
+	for _, encode := range []struct {
+		name string
+		fn   func(map[string]bigquery.Value, bigquery.Schema) ([]byte, error)
+	}{
+		{name: "load job", fn: encodeJSONRow},
+		{name: "storage write", fn: encodeStorageWriteRow},
+	} {
+		t.Run(encode.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := encode.fn(map[string]bigquery.Value{"req": nil}, schema); err == nil {
+				t.Fatal("error = nil, want a rejection of NULL in a REQUIRED column")
+			}
+		})
+	}
+}
+
+func TestStorageWriteWriterOptionsPutBqsinkLast(t *testing.T) {
+	t.Parallel()
+
+	md, err := rowDescriptor(abSchema())
+	if err != nil {
+		t.Fatalf("rowDescriptor() error = %v", err)
+	}
+	normalized, err := adapt.NormalizeDescriptor(md)
+	if err != nil {
+		t.Fatalf("NormalizeDescriptor() error = %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		strategy *StorageWrite
+		want     int
+	}{
+		{
+			name:     "a new stream carries the type, destination, descriptor and write retries",
+			strategy: &StorageWrite{},
+			want:     4,
+		},
+		{
+			name:     "an existing stream carries its name, the descriptor and write retries",
+			strategy: &StorageWrite{StreamName: "projects/test-project/datasets/test_dataset/tables/test_table/streams/s"},
+			want:     3,
+		},
+		{
+			name:     "DisableWriteRetries leaves the retry option off",
+			strategy: &StorageWrite{DisableWriteRetries: true},
+			want:     3,
+		},
+		{
+			name: "the caller's options are kept alongside",
+			strategy: &StorageWrite{WriterOptions: []managedwriter.WriterOption{
+				managedwriter.WithTraceID("test"),
+			}},
+			want: 5,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			writer, err := tt.strategy.NewWriter(testClient(t), testRelation())
+			if err != nil {
+				t.Fatalf("NewWriter() error = %v", err)
+			}
+			if got := len(writer.writerOptions(normalized)); got != tt.want {
+				t.Errorf("options = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestStorageWriteNewWriterAcceptsAStreamNameMatchingRelation checks that a
+// StreamName whose table agrees with relation does not trip the mismatch check.
+func TestStorageWriteNewWriterAcceptsAStreamNameMatchingRelation(t *testing.T) {
+	t.Parallel()
+
+	strategy := &StorageWrite{StreamName: "projects/test-project/datasets/test_dataset/tables/test_table/streams/s"}
+	writer, err := strategy.NewWriter(testClient(t), testRelation())
+	if err != nil {
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	want := testRelation()
+	want.ProjectID = "test-project"
+	if got := writer.Relation(); got != want {
+		t.Errorf("Relation() = %s, want %s", got, want)
+	}
+}
+
+// TestStorageWriteNewWriterRejectsAStreamNameForAnotherTable checks that NewWriter
+// catches a StreamName belonging to a different table, rather than letting relation
+// be silently ignored the way an already-open stream's type is.
+func TestStorageWriteNewWriterRejectsAStreamNameForAnotherTable(t *testing.T) {
+	t.Parallel()
+
+	strategy := &StorageWrite{StreamName: "projects/test-project/datasets/other_dataset/tables/other_table/streams/s"}
+	_, err := strategy.NewWriter(testClient(t), testRelation())
+	if err == nil {
+		t.Fatal("NewWriter() error = nil, want a rejection of a StreamName belonging to another table")
+	}
+	if !strings.Contains(err.Error(), "test-project.other_dataset.other_table") {
+		t.Errorf("NewWriter() error = %v, want it to name the table the StreamName belongs to", err)
+	}
+}
+
+func TestJSONColumnDiffersBetweenTransports(t *testing.T) {
+	t.Parallel()
+
+	schema := bigquery.Schema{{Name: "doc", Type: bigquery.JSONFieldType}}
+	row := map[string]bigquery.Value{"doc": `{"k":"v"}`}
+
+	// A load job reads the column's value, so the text is embedded. The Storage
+	// Write API's proto field is a string, so the text is quoted.
+	load, err := encodeJSONRow(row, schema)
+	if err != nil {
+		t.Fatalf("encodeJSONRow() error = %v", err)
+	}
+	if want := `{"doc":{"k":"v"}}`; string(load) != want {
+		t.Errorf("load job rendering = %s, want %s", load, want)
+	}
+
+	storage, err := encodeStorageWriteRow(row, schema)
+	if err != nil {
+		t.Fatalf("encodeStorageWriteRow() error = %v", err)
+	}
+	if want := `{"doc":"{\"k\":\"v\"}"}`; string(storage) != want {
+		t.Errorf("Storage Write rendering = %s, want %s", storage, want)
+	}
+}
+
+func TestJSONColumnRejectsInvalidText(t *testing.T) {
+	t.Parallel()
+
+	schema := bigquery.Schema{{Name: "doc", Type: bigquery.JSONFieldType}}
+	if _, err := encodeJSONRow(map[string]bigquery.Value{"doc": "not json"}, schema); err == nil {
+		t.Error("encodeJSONRow() error = nil, want a rejection of text that is not JSON")
+	}
+	if _, err := encodeJSONRow(map[string]bigquery.Value{"doc": 42}, schema); err == nil {
+		t.Error("encodeJSONRow() error = nil, want a rejection of a non-text value")
+	}
+}
+
+// TestStorageWriteNewWriterRejectsAMalformedStreamName covers the other way the
+// StreamName check can fail: a name that is not a stream name at all, which would
+// otherwise be compared against the relation as if it were one.
+func TestStorageWriteNewWriterRejectsAMalformedStreamName(t *testing.T) {
+	t.Parallel()
+
+	names := []string{
+		"not-a-stream-name",
+		"projects/p/datasets/d",
+		"proj/p/datasets/d/tables/t/streams/s",
+		"/////",
+	}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := (&StorageWrite{StreamName: name}).NewWriter(testClient(t), testRelation())
+			if err == nil {
+				t.Fatalf("NewWriter() error = nil for StreamName %q, want it refused", name)
+			}
+			if !strings.Contains(err.Error(), name) {
+				t.Errorf("NewWriter() error = %v, want it to name the stream it could not read", err)
+			}
+		})
+	}
+}
+
+// TestStorageWriteBindSchemaAfterCloseFails checks that BindSchema checks
+// closed the way WriteRows does. Without that check, calling BindSchema after
+// Close opens a fresh client and stream that Close already ran and so nothing
+// will ever close again: a leak reachable just by calling Close and then Sink,
+// no concurrency required.
+func TestStorageWriteBindSchemaAfterCloseFails(t *testing.T) {
+	t.Parallel()
+
+	writer, err := (&StorageWrite{}).NewWriter(testClient(t), testRelation())
+	if err != nil {
+		t.Fatalf("NewWriter() error = %v", err)
+	}
+	if err := writer.Close(t.Context()); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if err := writer.BindSchema(t.Context(), storageWriteSchema()); err == nil {
+		t.Fatal("BindSchema() error = nil, want a rejection of binding after Close")
+	} else if !strings.Contains(err.Error(), "closed") {
+		t.Errorf("BindSchema() error = %v, want it to say the writer is closed", err)
+	}
+	if writer.mwClient != nil || writer.stream != nil {
+		t.Error("BindSchema() opened a client or a stream after Close; neither will ever be closed")
+	}
+}
