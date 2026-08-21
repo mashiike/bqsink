@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.0.2](https://github.com/mashiike/bqsink/compare/v0.0.1...v0.0.2) - 2026-08-21
+
+- fix: detach BindSchema's ctx from the caller's cancellation by @mashiike in https://github.com/mashiike/bqsink/pull/11
+- chore(deps): Bump google.golang.org/protobuf from 1.36.11 to 1.36.12 by @dependabot[bot] in https://github.com/mashiike/bqsink/pull/10
+
 ## [v0.0.1](https://github.com/mashiike/bqsink/commits/v0.0.1) - 2026-08-07
 
 - feat: BigQuery ingestion that keeps the table in step with the declaration by @mashiike in https://github.com/mashiike/bqsink/pull/1
