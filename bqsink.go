@@ -456,8 +456,16 @@ func tableMetadataOf(rt reflect.Type) *bigquery.TableMetadata {
 //
 // It runs once and caches its outcome, success or failure alike. A later call
 // returns the same error without contacting BigQuery, so recovering from a failure
-// means building a new Sinker. Since the work happens on the first Sink, ctx belongs
-// to that caller; a ctx cancelled later has no effect.
+// means building a new Sinker. Since the work happens on the first Sink or Start,
+// ctx belongs to whichever caller that was: migrate is retried within that ctx's
+// deadline, so a caller whose ctx is scoped to a single request can make migrate
+// fail on a timeout that has nothing to do with BigQuery.
+//
+// BindSchema gets that ctx stripped of cancellation and deadline (context.WithoutCancel)
+// rather than the ctx itself, because a writer such as StorageWriter retains it for
+// the lifetime of a background connection; passing the caller's ctx through unchanged
+// would let that caller's later cancellation tear down every subsequent write from
+// any caller, not just its own.
 //
 // Another process changing the same table at the same time, which BigQuery reports
 // as a failed ETag precondition or a conflict, is retried here according to the
@@ -471,9 +479,28 @@ func (s *Sinker) start(ctx context.Context) error {
 				return
 			}
 		}
-		s.startErr = s.writer.BindSchema(ctx, s.schema)
+		s.startErr = s.writer.BindSchema(context.WithoutCancel(ctx), s.schema)
 	})
 	return s.startErr
+}
+
+// Start reconciles the real table with the declaration and binds the writer's
+// schema, the same work a first Sink or SinkAsync call would otherwise trigger.
+//
+// Calling it explicitly lets that work run on a ctx scoped to process startup
+// rather than to whichever request happens to call Sink first, since that ctx
+// outlives migrate's retries and the connection a writer such as StorageWriter
+// keeps open afterward (see start). A later Sink or SinkAsync still triggers
+// this work if Start was never called; calling Start again after it already
+// ran, whether it succeeded or failed, returns the same cached outcome without
+// contacting BigQuery.
+//
+// The work runs at most once, so it runs on whichever ctx got there first: call
+// Start and wait for it to return before letting Sink or SinkAsync run
+// concurrently, or a request that outraces Start binds the work to that
+// request's own ctx instead.
+func (s *Sinker) Start(ctx context.Context) error {
+	return s.start(ctx)
 }
 
 // Sink writes rows and waits for the writer's WriteResult to settle, returning
