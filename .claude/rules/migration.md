@@ -49,7 +49,7 @@ return s.dropColumns(ctx, change.DropColumns)
 | 段 | 何をする | いつ起きる | 失敗の性質 |
 |---|---|---|---|
 | `declarationOf`（`DeclarationOf` / `DeclarationFromMetadata` から呼ばれる） | タグ（または `md.Schema`）とメソッドから plan / schema / metadata を作る | `Declaration` の構築時。**`NewSinker` を呼ぶより前**で、`NewSinker` には持ち越さない | **ローカル。** ネットワークに出ない。**キャッシュしない** — `declarationOf` は値を返して終わるだけなので、`err` を持つ `Declaration` をそのまま `NewSinker` に渡せば同じ失敗が毎回起きる |
-| `start`（`startOnce`） | 実テーブルと和解し（`migrate`）、続けて `writer.BindSchema` を呼ぶ | 初回 `Sink` | **ネットワーク。** 412 / 503 はリトライで直る。結果は成否ともキャッシュ |
+| `start`（`startOnce`） | 実テーブルと和解し（`migrate`）、続けて `writer.BindSchema` を呼ぶ | 初回 `Sink`/`SinkAsync`、または明示的な `Start` | **ネットワーク。** 412 / 503 はリトライで直る。結果は成否ともキャッシュ |
 
 **この分け方の根拠は変わっていない**（旧「3段を1つの `Once` に畳んではいけない」と同じ）: **タグの誤字と 503 を同じキャッシュスロットに乗せない。** 前者は何度リトライしても直らず、後者は直りうる。以前は `Once` を2つ持って分けていたが、今は**ローカルな失敗が `Once` にすら触れない**（`declarationOf` は `sync.Once` の外、`NewSinker` を呼ぶより前に走り、結果を値として持ち歩くだけ）ので、構造的に混ざらない。**`migrate` と `BindSchema` は両方ネットワークなので同じ `Once` でよい。**
 
@@ -63,9 +63,29 @@ return s.dropColumns(ctx, change.DropColumns)
 
 `sync.Once` を使っているので、503 や IAM 権限の失敗は**プロセスが生きている間ずっと同じエラーを返す**。回復には再 `NewSinker` が必要。これは意図した設計。
 
-**ctx は初回 `Sink` の呼び出し側のものが使われる。** 後から別の ctx をキャンセルしても効かない。
+**`migrate` は初回 `Sink`/`SinkAsync`/`Start` の呼び出し側の ctx がそのまま使われる。** リトライも含めてそのデッドラインに縛られるので、常駐プロセスがリクエストごとの短命 ctx で最初の書き込みをしてしまうと、BigQuery とは無関係なタイムアウトで migrate が失敗し、それが `sync.Once` によって永久にキャッシュされる。これを避けたい呼び出し側は、`Sink`/`SinkAsync` より前に、プロセス起動時の長命な ctx で明示的に `Start` を呼ぶ。
 
-`sync.Once` の代わりに mutex + 成功フラグにすると失敗からリトライできるが、失敗し続ける間 `Sink` ごとに `Metadata` を叩くことになる。前者を選んでいる。
+`sync.Once` の代わりに mutex + 成功フラグにすると失敗からリトライできるが、失敗し続ける間 `Sink` ごとに `Metadata` を叩くことになる。前者を選んでいる。**この代替案は `BindSchema` 後に接続が壊れる別の問題（下記）には無力**——成功フラグは `BindSchema` が一度成功すれば立ったままなので、後から接続が壊れても再初期化されない。
+
+## `BindSchema` に渡す ctx だけ `context.WithoutCancel` する（2026-08-21）
+
+`migrate` とは対照的に、`writer.BindSchema` には `context.WithoutCancel(ctx)` を渡す。理由は `migrate` と非対称な事情が `BindSchema` 側にあるため。
+
+`StorageWriter.BindSchema` は `managedwriter.NewClient(ctx, ...)` を呼び、Storage Write API の GoDoc に "The context provided here is retained and used for background connection management" と明記されているとおり、この ctx は gRPC 接続プール全体の生存期間を支配する（実測: `cloud.google.com/go/bigquery/storage/managedwriter/client.go` の `NewClient` が `context.WithCancel(ctx)` で保持し、`createPool` がそれを親にし、`connection.go` の送信前チェックがそのキャンセルを見て即座にエラーを返す）。
+
+`start` が初回 `Sink`/`SinkAsync` の呼び出し元 ctx をそのまま渡すと、**その呼び出しがリクエストスコープの短命 ctx だった場合、リクエストが終わって ctx がキャンセルされた瞬間に、以後同じ `Sinker` を使うすべての書き込みが失敗する。** `BindSchema` を1回しか呼ばないので二度目のチャンスが無い。`context.WithoutCancel` は deadline・cancel を切り離し値だけ継承するので、この呼び出し元のその後のキャンセルは `BindSchema` が保持する接続に影響しなくなる。
+
+**当初「`NewClient`/`NewManagedStream` がハングした場合、呼び出し元の ctx キャンセルではそのハングを止められず、`writer.Close` や `start` を待つ他の呼び出し元まで無期限にブロックされ得る」と判断していたが、実測（gax-go / managedwriter のソースを読んで確認、2026-08-21）で誤りと分かった。**
+
+**実際は有界: `NewManagedStream` が呼ぶ RPC には gax の既定タイムアウトが付いている。** `GetWriteStream` は 600000ms（10分）、`CreateWriteStream`（`WithStreamName` 未指定など明示ストリームを開く経路でだけ追加で走る）は 1200000ms（20分）（`cloud.google.com/go/bigquery@v1.79.0/storage/apiv1/big_query_write_client.go:66-92`）。`NewClient` 内の `detect.ProjectID` は bqsink が具体的な ProjectID を渡す使い方（sentinel を使わない）なので、ネットワークに出ずに即 return する（`cloud.google.com/go@v0.123.0/internal/detect/detect.go:47-49`）。ハングし得る箇所は実質 `GetWriteStream` 1本。
+
+**`context.WithoutCancel` はこの既定タイムアウトを弱めるのではなく、確実に効かせる側に働く。** gax の `invoke` は「ctx に既に deadline があるときは `WithTimeout` オプションを使わない」という互換性のための分岐を持つ（`github.com/googleapis/gax-go/v2@v2.23.0/invoke.go:69-79`、コメント原文: "Only use the value provided via WithTimeout if the context doesn't already have a deadline"）。呼び出し元 ctx に deadline があれば以前はそれが優先され、gax の既定値は無視されていた。`context.WithoutCancel` は deadline も剥がすので、`Deadline()` が常に `ok=false` を返すようになり、この既定タイムアウトが常に働く状態になった。**「保護を外した」のではなく「呼び出し元の deadline が gax 既定の 10〜20分に置き換わった」というのが正確な理解。**
+
+この有界性から、`writer.Close` や `startOnce.Do` を待つ他の呼び出し元（`Sink`/`SinkAsync`）が巻き込まれるのも同様に最長 10〜20分で、無期限ではない。**対応: 現状のまま（追加の対策なし）でよいと判断した。** 起動時に `Sinker.Start(ctx)` を呼ぶ運用にすれば、この待ち窓はプロセス起動時に限定され、readiness probe 等で早期に気づける。
+
+**`BindSchema` に渡す ctx へ独自に `context.WithTimeout` を追加する対策は却下。** `NewClient`/`NewManagedStream` に渡した ctx は `context.WithCancel(ctx)` として接続の生存期間ずっと保持される（`storage/managedwriter/client.go:77`, `:196`）。ここに deadline を付けると、その時刻が来た瞬間に保持中の接続がキャンセルされて壊れる——今回まさに直した障害（呼び出し元 ctx のキャンセルで接続が破壊される）を、タイマー付きで再発させることになる。
+
+`LoadJobsWriter.BindSchema(_ context.Context, ...)` はそもそも ctx を使わないので、この変更の影響を受けない。
 
 ## etag による楽観ロック
 

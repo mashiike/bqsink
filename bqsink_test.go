@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/bigquery"
 	gax "github.com/googleapis/gax-go/v2"
@@ -662,6 +663,138 @@ func TestSinkAsyncStartsOnlyOnce(t *testing.T) {
 			t.Errorf("BindSchema was called %d times, want 1", binds)
 		}
 	})
+}
+
+// TestStart checks that the exported Start does the same first-call
+// reconciliation Sink and SinkAsync trigger implicitly, that it shares the
+// same startOnce so a later Sink does not repeat it, and that it caches a
+// failure the same way.
+func TestStart(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Start reconciles once and Sink does not repeat it", func(t *testing.T) {
+		t.Parallel()
+		fake := migratedTable()
+		writer := newFakeWriter(t)
+		s := newTestSinker[nestedRow](t, fake, writer)
+
+		if err := s.Start(t.Context()); err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		if _, err := s.Sink(t.Context(), nestedRow{A: "a", B: 1}); err != nil {
+			t.Fatalf("Sink() error = %v", err)
+		}
+		if _, _, metadataCalls := fake.snapshot(); metadataCalls != 1 {
+			t.Errorf("Metadata was called %d times, want 1; Sink must not repeat what Start already did", metadataCalls)
+		}
+		writer.mu.Lock()
+		binds := writer.binds
+		writer.mu.Unlock()
+		if binds != 1 {
+			t.Errorf("BindSchema was called %d times, want 1", binds)
+		}
+	})
+
+	t.Run("a failed Start is cached and returned by Sink without retrying", func(t *testing.T) {
+		t.Parallel()
+		fake := &fakeTable{metadataErr: errors.New("boom")}
+		writer := newFakeWriter(t)
+		s := newTestSinker[nestedRow](t, fake, writer)
+
+		if err := s.Start(t.Context()); err == nil {
+			t.Fatal("Start() error = nil, want the Metadata failure")
+		}
+		if _, err := s.Sink(t.Context(), nestedRow{A: "a", B: 1}); err == nil {
+			t.Fatal("Sink() error = nil, want Start's cached failure")
+		}
+		if _, _, metadataCalls := fake.snapshot(); metadataCalls != 1 {
+			t.Errorf("Metadata was called %d times, want 1; the failure must be cached, not retried by Sink", metadataCalls)
+		}
+		writer.mu.Lock()
+		binds := writer.binds
+		writer.mu.Unlock()
+		if binds != 0 {
+			t.Errorf("BindSchema was called %d times, want 0; migrate failed so BindSchema must not run", binds)
+		}
+	})
+
+	t.Run("calling Start again returns the cached outcome without contacting BigQuery", func(t *testing.T) {
+		t.Parallel()
+		fake := migratedTable()
+		writer := newFakeWriter(t)
+		s := newTestSinker[nestedRow](t, fake, writer)
+
+		if err := s.Start(t.Context()); err != nil {
+			t.Fatalf("first Start() error = %v", err)
+		}
+		if err := s.Start(t.Context()); err != nil {
+			t.Fatalf("second Start() error = %v", err)
+		}
+		if _, _, metadataCalls := fake.snapshot(); metadataCalls != 1 {
+			t.Errorf("Metadata was called %d times, want 1; a second Start must not repeat it", metadataCalls)
+		}
+		writer.mu.Lock()
+		binds := writer.binds
+		writer.mu.Unlock()
+		if binds != 1 {
+			t.Errorf("BindSchema was called %d times, want 1; a second Start must not repeat it", binds)
+		}
+	})
+}
+
+// TestMigrateCtxIsTheCallersUnlikeBindSchema checks that migrate, unlike
+// BindSchema, keeps running on the caller's own ctx: migrate retries within
+// that ctx's deadline (see start's doc comment), so it must observe the
+// caller's cancellation rather than a context.WithoutCancel copy.
+func TestMigrateCtxIsTheCallersUnlikeBindSchema(t *testing.T) {
+	t.Parallel()
+	fake := migratedTable()
+	writer := newFakeWriter(t)
+	s := newTestSinker[nestedRow](t, fake, writer)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	cancel()
+
+	_ = s.Start(ctx)
+
+	migrateCtx := fake.lastMetadataCtx()
+	if migrateCtx == nil {
+		t.Fatal("Metadata was never called")
+	}
+	if err := migrateCtx.Err(); err == nil {
+		t.Error("migrate's ctx.Err() = nil after the caller cancelled, want context.Canceled")
+	}
+}
+
+// TestBindSchemaCtxOutlivesTheCallersCancellation checks that BindSchema gets
+// a ctx that context.WithoutCancel has detached from the caller's: managedwriter
+// retains the ctx BindSchema is given for the lifetime of its background
+// connection, so a request-scoped caller cancelling its own ctx, or one whose
+// deadline later elapses, after the call must not be able to tear that
+// connection down for every later caller.
+func TestBindSchemaCtxOutlivesTheCallersCancellation(t *testing.T) {
+	t.Parallel()
+	fake := migratedTable()
+	writer := newFakeWriter(t)
+	s := newTestSinker[nestedRow](t, fake, writer)
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Hour)
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	cancel()
+
+	writer.mu.Lock()
+	boundCtx := writer.boundCtx
+	writer.mu.Unlock()
+	if err := boundCtx.Err(); err != nil {
+		t.Errorf("BindSchema's ctx.Err() = %v after the caller cancelled, want nil", err)
+	}
+	if _, ok := boundCtx.Deadline(); ok {
+		t.Error("BindSchema's ctx has a Deadline after context.WithoutCancel, want none")
+	}
 }
 
 // TestSinkAsyncRejectsATypeThatDoesNotMatchTheDeclaration checks that

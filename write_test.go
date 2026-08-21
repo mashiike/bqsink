@@ -23,6 +23,7 @@ type fakeWriter struct {
 	binds       int
 	boundSchema bigquery.Schema
 	boundLogger *slog.Logger
+	boundCtx    context.Context
 	bindErr     error
 
 	rows       []map[string]bigquery.Value
@@ -68,12 +69,14 @@ func (w *fakeWriter) BindLogger(logger *slog.Logger) {
 	w.boundLogger = logger
 }
 
-// BindSchema implements RowsWriter.
-func (w *fakeWriter) BindSchema(_ context.Context, schema bigquery.Schema) error {
+// BindSchema implements RowsWriter. It keeps the ctx it was given so a test
+// can check whether the caller's later cancellation reached it.
+func (w *fakeWriter) BindSchema(ctx context.Context, schema bigquery.Schema) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.binds++
 	w.boundSchema = schema
+	w.boundCtx = ctx
 	return w.bindErr
 }
 

@@ -39,16 +39,24 @@ type fakeTable struct {
 	updates    []updateCall
 
 	metadataCalls int
+	metadataCtx   context.Context
 }
 
 func (f *fakeTable) Metadata(ctx context.Context, opts ...bigquery.TableMetadataOption) (*bigquery.TableMetadata, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.metadataCalls++
+	f.metadataCtx = ctx
 	if f.metadataErr != nil {
 		return nil, f.metadataErr
 	}
 	return f.metadata, nil
+}
+
+func (f *fakeTable) lastMetadataCtx() context.Context {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.metadataCtx
 }
 
 func (f *fakeTable) Create(ctx context.Context, tm *bigquery.TableMetadata) error {
